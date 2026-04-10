@@ -90,5 +90,24 @@ pamo_error pamo_remesh(pamo_mesh *out, const pamo_mesh *in,
     fprintf(stderr, "Stage 1: extracted %zu verts, %zu faces\n",
             out->n_verts, out->n_faces);
 
+    /* Post-process: detect and fix non-manifold edges.
+     * For edges with >2 incident faces, keep only 2 and remove others. */
+    err = pamo_mesh_build_adjacency(out);
+    if (err == PAMO_OK && out->edge_face_offset) {
+        bool has_nm = false;
+        for (size_t ei = 0; ei < out->n_edges; ei++) {
+            int32_t s = out->edge_face_offset[ei];
+            int32_t e = out->edge_face_offset[ei + 1];
+            if (e - s > 2) {
+                has_nm = true;
+                for (int32_t j = s + 2; j < e; j++) {
+                    out->face_alive[out->edge_face_list[j]] = false;
+                }
+            }
+        }
+        pamo_mesh_free_adjacency(out);
+        if (has_nm) pamo_mesh_compact(out);
+    }
+
     return PAMO_OK;
 }

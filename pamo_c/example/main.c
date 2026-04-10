@@ -140,9 +140,27 @@ int main(int argc, char **argv) {
     printf("Stage1 : %s\n", stage1 ? "True" : "False");
     printf("Stage3 : %s\n", stage3 ? "True" : "False");
 
-    /* Stage 1: Remeshing (TODO) */
+    /* Stage 1: Remeshing */
     if (stage1) {
-        fprintf(stderr, "Stage 1 not yet implemented, skipping.\n");
+        pamo_remesh_opts ropts = pamo_remesh_opts_default();
+        /* Adapt resolution to mesh size. */
+        if (mesh.n_faces <= 50) ropts.resolution = 64;
+        else if (mesh.n_faces <= 1000) ropts.resolution = 128;
+        else ropts.resolution = 256;
+
+        fprintf(stderr, "Running Stage 1: remesh (R=%d)...\n", ropts.resolution);
+        pamo_mesh remeshed;
+        err = pamo_remesh(&remeshed, &mesh, &ropts, &alloc);
+        if (err == PAMO_OK && remeshed.n_faces > 0) {
+            pamo_mesh_destroy(&mesh);
+            mesh = remeshed;
+            fprintf(stderr, "Stage 1: %zu verts, %zu faces\n",
+                    mesh.n_verts, mesh.n_faces);
+        } else {
+            fprintf(stderr, "Stage 1 failed (%s), using original mesh.\n",
+                    pamo_error_string(err));
+            if (remeshed.n_verts > 0) pamo_mesh_destroy(&remeshed);
+        }
     }
 
     /* Stage 2: Simplification */

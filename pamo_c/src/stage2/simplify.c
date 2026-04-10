@@ -103,9 +103,10 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
     if (!m->vert_alive[u] || !m->vert_alive[v]) return COST_INF;
     if (vert_locked && (vert_locked[u] || vert_locked[v])) return COST_INF;
 
-    /* Manifold check. */
+    /* Manifold check: reject non-manifold edges (sn > 2).
+     * Allow interior edges (sn == 2) and boundary edges (sn <= 1). */
     int32_t sn = pamo_shared_neighbor_count(m, u, v);
-    if (sn != 2) return COST_INF;
+    if (sn > 2) return COST_INF;
 
     pamo_vec3d pu = m->verts[u];
     pamo_vec3d pv = m->verts[v];

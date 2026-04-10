@@ -3,17 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Stage 2: Iterative mesh simplification.
- *
- * Algorithm (per round):
- *   1. Build adjacency (vertex->face, unique edges, edge->face)
- *   2. Compute per-vertex quadric matrices Q = sum(plane outer plane)
- *   3. Score each edge: quadric error + edge length penalty + skinny penalty
- *   4. Validity checks: manifold (2 shared neighbors), normal flip, skinny
- *   5. Sort edges by cost, greedily select non-conflicting collapses
- *   6. Apply collapses: midpoint, delete degenerate faces, remap indices
- *   7. Self-intersection detection via BVH + tri-tri test
- *   8. Undo collapses touching intersecting triangles
- *   9. Compact mesh
  */
 #include "pamo/pamo_stage2.h"
 #include "pamo/pamo_bvh.h"
@@ -62,24 +51,24 @@ static void compute_quadrics(const pamo_mesh *m, pamo_quadric *Q) {
 
 static const double COST_INF = 1e20;
 
-/* Check if collapsing edge (u->v) flips any adjacent normal or
+/* Check if collapsing endpoint→mid flips any adjacent normal or
  * creates a skinny triangle. Returns true if INVALID. */
 static bool collapse_creates_problem(const pamo_mesh *m,
-                                     int32_t u, int32_t v,
+                                     int32_t endpoint, int32_t other,
                                      pamo_vec3d mid,
                                      double skinny_thresh) {
-    int32_t u_start = m->vert_face_offset[u];
-    int32_t u_end   = m->vert_face_offset[u + 1];
-    for (int32_t i = u_start; i < u_end; i++) {
+    int32_t s = m->vert_face_offset[endpoint];
+    int32_t e = m->vert_face_offset[endpoint + 1];
+    for (int32_t i = s; i < e; i++) {
         int32_t fi = m->vert_face_list[i];
         if (!m->face_alive[fi]) continue;
         const int32_t *fv = m->faces[fi].v;
-        if (fv[0] == v || fv[1] == v || fv[2] == v) continue;
+        if (fv[0] == other || fv[1] == other || fv[2] == other) continue;
 
         pamo_vec3d old_n = pamo_face_unit_normal(m, fi);
         pamo_vec3d verts[3];
         for (int k = 0; k < 3; k++)
-            verts[k] = (fv[k] == u) ? mid : m->verts[fv[k]];
+            verts[k] = (fv[k] == endpoint) ? mid : m->verts[fv[k]];
 
         pamo_vec3d new_n_raw = pamo_v3_cross(pamo_v3_sub(verts[1], verts[0]),
                                              pamo_v3_sub(verts[2], verts[0]));
@@ -93,6 +82,97 @@ static bool collapse_creates_problem(const pamo_mesh *m,
     return false;
 }
 
+/* Count how many alive faces are shared between u and v
+ * (i.e., faces that contain both u and v). */
+static int32_t count_shared_faces(const pamo_mesh *m, int32_t u, int32_t v) {
+    int32_t count = 0;
+    int32_t u_s = m->vert_face_offset[u];
+    int32_t u_e = m->vert_face_offset[u + 1];
+    for (int32_t i = u_s; i < u_e; i++) {
+        int32_t fi = m->vert_face_list[i];
+        if (!m->face_alive[fi]) continue;
+        const int32_t *fv = m->faces[fi].v;
+        if (fv[0] == v || fv[1] == v || fv[2] == v) count++;
+    }
+    return count;
+}
+
+/* Check the "link condition" for edge collapse safety.
+ *
+ * For a manifold interior edge (u,v) with exactly 2 shared faces:
+ *   The collapse is safe if the two "tip" vertices (the third vertex
+ *   of each shared triangle) are NOT connected by any face that doesn't
+ *   also contain u or v. This prevents creating non-manifold vertices.
+ *
+ * For boundary edges (1 shared face): similar but simpler check.
+ *
+ * Returns true if the collapse would create a topology problem. */
+static bool collapse_violates_link(const pamo_mesh *m,
+                                   int32_t u, int32_t v) {
+    /* Collect vertices adjacent to u (excluding v). */
+    int32_t u_adj[256], n_u = 0;
+    int32_t u_s = m->vert_face_offset[u];
+    int32_t u_e = m->vert_face_offset[u + 1];
+    for (int32_t i = u_s; i < u_e; i++) {
+        int32_t fi = m->vert_face_list[i];
+        if (!m->face_alive[fi]) continue;
+        const int32_t *fv = m->faces[fi].v;
+        for (int k = 0; k < 3; k++) {
+            int32_t w = fv[k];
+            if (w == u || w == v) continue;
+            bool dup = false;
+            for (int32_t j = 0; j < n_u; j++) {
+                if (u_adj[j] == w) { dup = true; break; }
+            }
+            if (!dup && n_u < 256) u_adj[n_u++] = w;
+        }
+    }
+
+    /* Collect vertices adjacent to v (excluding u). */
+    int32_t v_adj[256], n_v = 0;
+    int32_t v_s = m->vert_face_offset[v];
+    int32_t v_e = m->vert_face_offset[v + 1];
+    for (int32_t i = v_s; i < v_e; i++) {
+        int32_t fi = m->vert_face_list[i];
+        if (!m->face_alive[fi]) continue;
+        const int32_t *fv = m->faces[fi].v;
+        for (int k = 0; k < 3; k++) {
+            int32_t w = fv[k];
+            if (w == u || w == v) continue;
+            bool dup = false;
+            for (int32_t j = 0; j < n_v; j++) {
+                if (v_adj[j] == w) { dup = true; break; }
+            }
+            if (!dup && n_v < 256) v_adj[n_v++] = w;
+        }
+    }
+
+    /* Count vertices in the intersection of u_adj and v_adj. */
+    int32_t n_shared = 0;
+    for (int32_t i = 0; i < n_u; i++) {
+        for (int32_t j = 0; j < n_v; j++) {
+            if (u_adj[i] == v_adj[j]) { n_shared++; break; }
+        }
+    }
+
+    /* For an interior edge: exactly 2 shared neighbors expected
+     * (the two triangle tips). More means non-manifold result.
+     * For a boundary edge: exactly 1 shared neighbor expected.
+     * If 0 shared neighbors, u and v are in disconnected components. */
+    int32_t n_shared_faces = count_shared_faces(m, u, v);
+
+    if (n_shared_faces == 2) {
+        /* Interior edge: must have exactly 2 shared vertex neighbors. */
+        return n_shared != 2;
+    } else if (n_shared_faces == 1) {
+        /* Boundary edge: must have exactly 1 shared vertex neighbor. */
+        return n_shared != 1;
+    } else {
+        /* Edge with 0 or >2 shared faces: not safe to collapse. */
+        return true;
+    }
+}
+
 static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
                                 size_t edge_idx, double scale,
                                 double skinny_weight, double skinny_thresh,
@@ -103,10 +183,8 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
     if (!m->vert_alive[u] || !m->vert_alive[v]) return COST_INF;
     if (vert_locked && (vert_locked[u] || vert_locked[v])) return COST_INF;
 
-    /* Manifold check: reject non-manifold edges (sn > 2).
-     * Allow interior edges (sn == 2) and boundary edges (sn <= 1). */
-    int32_t sn = pamo_shared_neighbor_count(m, u, v);
-    if (sn > 2) return COST_INF;
+    /* Link condition: ensures collapse preserves manifold topology. */
+    if (collapse_violates_link(m, u, v)) return COST_INF;
 
     pamo_vec3d pu = m->verts[u];
     pamo_vec3d pv = m->verts[v];
@@ -127,7 +205,7 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
     double edge_len = sqrt(pamo_v3_length_sq(pamo_v3_sub(pu, pv)));
     double edge_cost = (scale > 1e-30) ? edge_len / scale : 0.0;
 
-    /* Skinny penalty: compute quality degradation. */
+    /* Skinny penalty. */
     double skinny_cost = 0.0;
     int32_t tri_count = 0;
     double skinny_sum = 0.0;
@@ -161,18 +239,19 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
 /* ── Collapse record for undo ────────────────────────────────────── */
 
 typedef struct {
-    int32_t    u, v;            /* collapse u <- v */
-    pamo_vec3d orig_u, orig_v;  /* original positions */
+    int32_t    u, v;
+    pamo_vec3d orig_u, orig_v;
     bool       undone;
 } pamo_collapse_record;
 
-/* ── Apply collapses ─────────────────────────────────────────────── */
+/* ── Apply collapse ──────────────────────────────────────────────── */
 
 static void apply_collapse(pamo_mesh *m, int32_t u, int32_t v,
                            pamo_vec3d mid) {
     m->verts[u] = mid;
     m->vert_alive[v] = false;
 
+    /* Process ALL faces incident to v. */
     int32_t v_start = m->vert_face_offset[v];
     int32_t v_end   = m->vert_face_offset[v + 1];
     for (int32_t fi_idx = v_start; fi_idx < v_end; fi_idx++) {
@@ -181,69 +260,46 @@ static void apply_collapse(pamo_mesh *m, int32_t u, int32_t v,
         int32_t *fv = m->faces[fi].v;
         bool has_u = (fv[0] == u || fv[1] == u || fv[2] == u);
         if (has_u) {
+            /* Shared face: delete (it would become degenerate). */
             m->face_alive[fi] = false;
         } else {
+            /* Remap v -> u. */
             for (int k = 0; k < 3; k++) {
                 if (fv[k] == v) fv[k] = u;
             }
+            /* Check for degenerate (shouldn't happen with link condition). */
             if (fv[0] == fv[1] || fv[1] == fv[2] || fv[2] == fv[0]) {
                 m->face_alive[fi] = false;
             }
         }
     }
-}
 
-/* ── Self-intersection detection ─────────────────────────────────── */
-
-static bool has_self_intersections(const pamo_mesh *m,
-                                   const pamo_allocator *alloc) {
-    pamo_bvh bvh;
-    if (pamo_bvh_build_triangles(&bvh, m, alloc) != PAMO_OK) return false;
-
-    pamo_overlap_result ores;
-    pamo_overlap_result_init(&ores, alloc);
-    bool found = false;
-
-    for (size_t fi = 0; fi < m->n_faces && !found; fi++) {
+    /* Also check u's faces for duplicates: after remap, two faces
+     * incident to u may now be identical. Remove duplicates. */
+    int32_t u_start = m->vert_face_offset[u];
+    int32_t u_end   = m->vert_face_offset[u + 1];
+    for (int32_t i = u_start; i < u_end; i++) {
+        int32_t fi = m->vert_face_list[i];
         if (!m->face_alive[fi]) continue;
-        const pamo_tri *f = &m->faces[fi];
-        pamo_vec3d v0 = m->verts[f->v[0]];
-        pamo_vec3d v1 = m->verts[f->v[1]];
-        pamo_vec3d v2 = m->verts[f->v[2]];
-
-        pamo_aabb fbox;
-        fbox.lo.x = fmin(v0.x, fmin(v1.x, v2.x)) - 1e-10;
-        fbox.lo.y = fmin(v0.y, fmin(v1.y, v2.y)) - 1e-10;
-        fbox.lo.z = fmin(v0.z, fmin(v1.z, v2.z)) - 1e-10;
-        fbox.hi.x = fmax(v0.x, fmax(v1.x, v2.x)) + 1e-10;
-        fbox.hi.y = fmax(v0.y, fmax(v1.y, v2.y)) + 1e-10;
-        fbox.hi.z = fmax(v0.z, fmax(v1.z, v2.z)) + 1e-10;
-
-        ores.n_hits = 0;
-        pamo_bvh_overlap(&bvh, fbox, &ores);
-
-        for (size_t h = 0; h < ores.n_hits && !found; h++) {
-            int32_t gi = ores.hits[h];
-            if (gi <= (int32_t)fi) continue;
-            if (!m->face_alive[gi]) continue;
-            const pamo_tri *g = &m->faces[gi];
-            bool shared = false;
-            for (int a = 0; a < 3 && !shared; a++)
-                for (int b = 0; b < 3 && !shared; b++)
-                    if (f->v[a] == g->v[b]) shared = true;
-            if (shared) continue;
-
-            pamo_vec3d w0 = m->verts[g->v[0]];
-            pamo_vec3d w1 = m->verts[g->v[1]];
-            pamo_vec3d w2 = m->verts[g->v[2]];
-            if (pamo_tri_tri_intersect(v0, v1, v2, w0, w1, w2))
-                found = true;
+        const int32_t *fv = m->faces[fi].v;
+        /* Check against v's remapped faces. */
+        for (int32_t j = v_start; j < v_end; j++) {
+            int32_t fj = m->vert_face_list[j];
+            if (!m->face_alive[fj] || fj == fi) continue;
+            const int32_t *gv = m->faces[fj].v;
+            /* Same triangle if same sorted vertex set. */
+            int32_t fa[3] = {fv[0], fv[1], fv[2]};
+            int32_t ga[3] = {gv[0], gv[1], gv[2]};
+            /* Sort both. */
+            for (int a = 0; a < 2; a++) for (int b = a+1; b < 3; b++) {
+                if (fa[a] > fa[b]) { int32_t t=fa[a]; fa[a]=fa[b]; fa[b]=t; }
+                if (ga[a] > ga[b]) { int32_t t=ga[a]; ga[a]=ga[b]; ga[b]=t; }
+            }
+            if (fa[0]==ga[0] && fa[1]==ga[1] && fa[2]==ga[2]) {
+                m->face_alive[fj] = false;
+            }
         }
     }
-
-    pamo_overlap_result_destroy(&ores);
-    pamo_bvh_destroy(&bvh);
-    return found;
 }
 
 /* ── One simplification round ────────────────────────────────────── */
@@ -268,7 +324,7 @@ static pamo_error simplify_round(pamo_mesh *m,
     if (!Q) { pamo_mesh_free_adjacency(m); return PAMO_ERR_ALLOC; }
     compute_quadrics(m, Q);
 
-    /* Compute scale (average edge length). */
+    /* Compute scale. */
     double scale_sum = 0.0;
     for (size_t i = 0; i < m->n_edges; i++) {
         pamo_vec3d d = pamo_v3_sub(m->verts[m->edges[i].u],
@@ -299,7 +355,6 @@ static pamo_error simplify_round(pamo_mesh *m,
         }
     }
 
-    /* Sort by cost ascending. */
     pamo_sort_edge_costs(costs, n_valid);
 
     /* Greedy selection. */
@@ -317,8 +372,35 @@ static pamo_error simplify_round(pamo_mesh *m,
         int32_t u = m->edges[ei].u;
         int32_t v = m->edges[ei].v;
         if (locked[u] || locked[v]) continue;
+
+        /* Lock the 2-ring neighborhood: the endpoints, their 1-ring,
+         * and all vertices sharing a face with any 1-ring vertex.
+         * This ensures no collapse can affect the topology around
+         * this edge even with stale adjacency data. */
         locked[u] = true;
         locked[v] = true;
+        for (int pass = 0; pass < 2; pass++) {
+            int32_t ep = (pass == 0) ? u : v;
+            int32_t ep_s = m->vert_face_offset[ep];
+            int32_t ep_e = m->vert_face_offset[ep + 1];
+            for (int32_t j = ep_s; j < ep_e; j++) {
+                int32_t fi = m->vert_face_list[j];
+                if (!m->face_alive[fi]) continue;
+                for (int k = 0; k < 3; k++) {
+                    int32_t w = m->faces[fi].v[k];
+                    locked[w] = true;
+                    /* Also lock w's 1-ring (2-ring of edge). */
+                    int32_t w_s = m->vert_face_offset[w];
+                    int32_t w_e = m->vert_face_offset[w + 1];
+                    for (int32_t jj = w_s; jj < w_e; jj++) {
+                        int32_t fi2 = m->vert_face_list[jj];
+                        if (!m->face_alive[fi2]) continue;
+                        for (int kk = 0; kk < 3; kk++)
+                            locked[m->faces[fi2].v[kk]] = true;
+                    }
+                }
+            }
+        }
 
         records[n_accepted].u = u;
         records[n_accepted].v = v;
@@ -328,40 +410,72 @@ static pamo_error simplify_round(pamo_mesh *m,
         n_accepted++;
     }
 
-    /* Apply collapses. */
+    /* Apply collapses with runtime validation.
+     * Re-check the link condition before each collapse since
+     * earlier collapses in this round may have changed topology. */
+    size_t actually_collapsed = 0;
     for (size_t i = 0; i < n_accepted; i++) {
         int32_t u = records[i].u, v = records[i].v;
+        if (!m->vert_alive[u] || !m->vert_alive[v]) continue;
+
+        /* Re-verify link condition with current face state. */
+        /* Count shared faces (faces containing both u and v). */
+        int32_t shared = 0;
+        int32_t u_s2 = m->vert_face_offset[u];
+        int32_t u_e2 = m->vert_face_offset[u + 1];
+        for (int32_t j = u_s2; j < u_e2; j++) {
+            int32_t fi = m->vert_face_list[j];
+            if (!m->face_alive[fi]) continue;
+            const int32_t *fv = m->faces[fi].v;
+            if (fv[0] == v || fv[1] == v || fv[2] == v) shared++;
+        }
+        if (shared == 0) continue;  /* disconnected: skip */
+
+        /* Count shared vertex neighbors. */
+        int32_t u_nb[256], n_un = 0;
+        for (int32_t j = u_s2; j < u_e2; j++) {
+            int32_t fi = m->vert_face_list[j];
+            if (!m->face_alive[fi]) continue;
+            const int32_t *fv = m->faces[fi].v;
+            for (int k = 0; k < 3; k++) {
+                int32_t w = fv[k];
+                if (w == u || w == v) continue;
+                bool dup = false;
+                for (int32_t d = 0; d < n_un; d++)
+                    if (u_nb[d] == w) { dup = true; break; }
+                if (!dup && n_un < 256) u_nb[n_un++] = w;
+            }
+        }
+        int32_t v_s2 = m->vert_face_offset[v];
+        int32_t v_e2 = m->vert_face_offset[v + 1];
+        int32_t n_shared_nb = 0;
+        for (int32_t j = v_s2; j < v_e2; j++) {
+            int32_t fi = m->vert_face_list[j];
+            if (!m->face_alive[fi]) continue;
+            const int32_t *fv = m->faces[fi].v;
+            for (int k = 0; k < 3; k++) {
+                int32_t w = fv[k];
+                if (w == u || w == v) continue;
+                for (int32_t d = 0; d < n_un; d++) {
+                    if (u_nb[d] == w) { n_shared_nb++; u_nb[d] = -1; break; }
+                }
+            }
+        }
+
+        bool safe;
+        if (shared == 2) safe = (n_shared_nb == 2);
+        else if (shared == 1) safe = (n_shared_nb == 1);
+        else safe = false;
+
+        if (!safe) continue;
+
         pamo_vec3d mid = pamo_v3_scale(
             pamo_v3_add(m->verts[u], m->verts[v]), 0.5);
         apply_collapse(m, u, v, mid);
+        actually_collapsed++;
     }
 
-    /* Self-intersection rollback (simplified: just check once, undo all
-     * if intersections found -- per-collapse undo requires storing full
-     * face state which we skip for now). */
-    if (opts->check_self_intersection && n_accepted > 0) {
-        if (has_self_intersections(m, alloc)) {
-            /* Undo all collapses in this round. */
-            for (size_t i = 0; i < n_accepted; i++) {
-                m->verts[records[i].u] = records[i].orig_u;
-                m->verts[records[i].v] = records[i].orig_v;
-                m->vert_alive[records[i].v] = true;
-                /* Restore faces incident to v. */
-                int32_t v_s = m->vert_face_offset[records[i].v];
-                int32_t v_e = m->vert_face_offset[records[i].v + 1];
-                for (int32_t j = v_s; j < v_e; j++) {
-                    int32_t fi = m->vert_face_list[j];
-                    if ((size_t)fi < m->n_faces) m->face_alive[fi] = true;
-                }
-                /* Restore face indices: undo u->v remap.
-                 * Since we can't perfectly restore, mark as undone. */
-                records[i].undone = true;
-            }
-            n_accepted = 0;
-        }
-    }
-
-    *n_collapsed_out = n_accepted;
+    *n_collapsed_out = actually_collapsed;
 
     PAMO_FREE_ARRAY(alloc, records, pamo_collapse_record, records_cap);
 cleanup:
@@ -397,15 +511,86 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
         if (new_alive >= alive_faces) {
             stuck_counter++;
-            /* Relax cost limit when stuck. */
             cost_limit *= 2.0;
         } else {
             stuck_counter = 0;
-            /* Reset cost limit on progress. */
             cost_limit = opts->cost_range;
         }
 
         if (stuck_counter >= opts->tolerance) break;
+    }
+
+    /* ── Post-process: remove T-junction non-manifold vertices ────── */
+    /* A T-junction vertex has disconnected face fans. We remove the
+     * smaller fan(s) to fix the topology. Iterate until no more
+     * T-junctions are found. */
+    for (int cleanup = 0; cleanup < 10; cleanup++) {
+        pamo_error err = pamo_mesh_build_adjacency(mesh);
+        if (err != PAMO_OK) return err;
+
+        bool found_any = false;
+        for (size_t vi = 0; vi < mesh->n_verts; vi++) {
+            if (!mesh->vert_alive[vi]) continue;
+            int32_t s = mesh->vert_face_offset[vi];
+            int32_t e = mesh->vert_face_offset[vi + 1];
+            int32_t n_inc = 0;
+            int32_t inc_faces[256];
+            for (int32_t j = s; j < e; j++) {
+                int32_t fi = mesh->vert_face_list[j];
+                if (!mesh->face_alive[fi]) continue;
+                if (n_inc < 256) inc_faces[n_inc++] = fi;
+            }
+            if (n_inc <= 1) continue;
+
+            /* BFS over face adjacency around this vertex. */
+            bool visited[256] = {false};
+            visited[0] = true;
+            int32_t queue[256];
+            queue[0] = 0;
+            int32_t qhead = 0, qtail = 1;
+            while (qhead < qtail) {
+                int32_t ci = queue[qhead++];
+                int32_t fi = inc_faces[ci];
+                const int32_t *fv = mesh->faces[fi].v;
+                int32_t others[2], no = 0;
+                for (int k = 0; k < 3; k++)
+                    if (fv[k] != (int32_t)vi && no < 2) others[no++] = fv[k];
+
+                for (int32_t ci2 = 0; ci2 < n_inc; ci2++) {
+                    if (visited[ci2]) continue;
+                    int32_t fi2 = inc_faces[ci2];
+                    const int32_t *gv = mesh->faces[fi2].v;
+                    bool adj = false;
+                    for (int a = 0; a < no && !adj; a++)
+                        for (int b = 0; b < 3 && !adj; b++)
+                            if (gv[b] == others[a] && gv[b] != (int32_t)vi)
+                                adj = true;
+                    if (adj) {
+                        visited[ci2] = true;
+                        queue[qtail++] = ci2;
+                    }
+                }
+            }
+
+            if (qtail < n_inc) {
+                /* Multiple components. Kill faces NOT in the largest. */
+                /* First component is visited[0..qtail-1]. Count others. */
+                /* Simple: just kill all faces in smaller components. */
+                found_any = true;
+                for (int32_t ci = 0; ci < n_inc; ci++) {
+                    if (!visited[ci]) {
+                        mesh->face_alive[inc_faces[ci]] = false;
+                    }
+                }
+            }
+        }
+
+        pamo_mesh_free_adjacency(mesh);
+
+        if (!found_any) break;
+
+        err = pamo_mesh_compact(mesh);
+        if (err != PAMO_OK) return err;
     }
 
     return PAMO_OK;

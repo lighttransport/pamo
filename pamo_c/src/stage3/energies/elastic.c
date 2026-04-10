@@ -3,21 +3,24 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Triangle-based elastic energy (Saint Venant-Kirchhoff model).
- * Penalizes deformation from the rest state.
  *
- * For each triangle:
- *   F = Ds * inv(Dm)     (deformation gradient)
- *   E_tri = 0.5 * (F^T F - I)  (Green strain)
- *   energy = mu * tr(E^T E) + lambda/2 * tr(E)^2
- * summed over triangles, weighted by rest area.
+ * For each triangle with rest edges e1_r, e2_r and current edges e1, e2:
+ *   Dm = [e1_r, e2_r]  (3x2 edge matrix in rest config)
+ *   Ds = [e1, e2]      (3x2 edge matrix in current config)
+ *   F = Ds * inv(Dm^T Dm) * Dm^T   (deformation gradient via metric)
+ *   Green strain: S = 0.5 * (Ds^T Ds * inv(Dm^T Dm) - I)
+ *   Energy: psi = mu * tr(S^T S) + lambda/2 * tr(S)^2
+ *
+ * We use the metric formulation to avoid computing F explicitly.
  */
 #include "pamo/pamo_types.h"
 #include "pamo/pamo_mesh.h"
 
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 
-/* 2x2 matrix type for the 2D reference frame. */
+/* 2x2 matrix. */
 typedef struct { double m[2][2]; } mat2;
 
 static mat2 mat2_inv(mat2 M) {
@@ -31,50 +34,62 @@ static mat2 mat2_inv(mat2 M) {
     return R;
 }
 
-/* Per-triangle rest state. */
+/* Per-triangle precomputed rest state. */
 typedef struct {
-    mat2   inv_Dm;    /* inverse of rest edge matrix */
-    double rest_area; /* rest triangle area */
-} pamo_elastic_tri_state;
+    mat2   inv_DtD; /* inverse of Dm^T * Dm */
+    double area;    /* rest area */
+} pamo_elastic_rest;
 
-/* Precompute rest state for all triangles. */
-pamo_error pamo_elastic_precompute(const pamo_mesh *m,
-                                   const pamo_vec3d *rest_verts,
-                                   pamo_elastic_tri_state *state) {
+/* Precompute rest state for all faces. Caller allocates rest[n_faces]. */
+void pamo_elastic_precompute(const pamo_mesh *m,
+                             const pamo_vec3d *rest_verts,
+                             pamo_elastic_rest *rest) {
     for (size_t fi = 0; fi < m->n_faces; fi++) {
-        if (!m->face_alive[fi]) {
-            state[fi].rest_area = 0.0;
-            continue;
-        }
+        rest[fi].area = 0.0;
+        if (!m->face_alive[fi]) continue;
         const int32_t *fv = m->faces[fi].v;
-        pamo_vec3d v0 = rest_verts[fv[0]];
-        pamo_vec3d v1 = rest_verts[fv[1]];
-        pamo_vec3d v2 = rest_verts[fv[2]];
+        pamo_vec3d e1 = pamo_v3_sub(rest_verts[fv[1]], rest_verts[fv[0]]);
+        pamo_vec3d e2 = pamo_v3_sub(rest_verts[fv[2]], rest_verts[fv[0]]);
 
-        /* Dm = [v1-v0, v2-v0] projected into triangle plane.
-         * For simplicity, compute in 3D and use a 2D parameterization. */
-        pamo_vec3d e1 = pamo_v3_sub(v1, v0);
-        pamo_vec3d e2 = pamo_v3_sub(v2, v0);
+        mat2 DtD;
+        DtD.m[0][0] = pamo_v3_dot(e1, e1);
+        DtD.m[0][1] = pamo_v3_dot(e1, e2);
+        DtD.m[1][0] = DtD.m[0][1];
+        DtD.m[1][1] = pamo_v3_dot(e2, e2);
 
-        /* 2x2 metric tensor: Dm^T Dm */
-        mat2 Dm;
-        Dm.m[0][0] = pamo_v3_dot(e1, e1);
-        Dm.m[0][1] = pamo_v3_dot(e1, e2);
-        Dm.m[1][0] = Dm.m[0][1];
-        Dm.m[1][1] = pamo_v3_dot(e2, e2);
-
-        state[fi].inv_Dm = mat2_inv(Dm);
-
+        rest[fi].inv_DtD = mat2_inv(DtD);
         pamo_vec3d cross = pamo_v3_cross(e1, e2);
-        state[fi].rest_area = 0.5 * sqrt(pamo_v3_length_sq(cross));
+        rest[fi].area = 0.5 * sqrt(pamo_v3_length_sq(cross));
     }
-    return PAMO_OK;
 }
 
-/* Compute elastic energy for all triangles. */
-double pamo_elastic_energy(const pamo_mesh *m,
-                           const pamo_vec3d *q,
-                           const pamo_elastic_tri_state *state,
+/* Compute Green strain components S00, S01, S11 for one triangle. */
+static void green_strain(const pamo_vec3d *q, const int32_t *fv,
+                         const mat2 *inv_DtD,
+                         double *S00, double *S01, double *S11) {
+    pamo_vec3d e1 = pamo_v3_sub(q[fv[1]], q[fv[0]]);
+    pamo_vec3d e2 = pamo_v3_sub(q[fv[2]], q[fv[0]]);
+
+    /* C = inv_DtD * [e1.e1  e1.e2; e1.e2  e2.e2] = metric in ref coords. */
+    double g00 = pamo_v3_dot(e1, e1);
+    double g01 = pamo_v3_dot(e1, e2);
+    double g11 = pamo_v3_dot(e2, e2);
+
+    const mat2 *I = inv_DtD;
+    double C00 = I->m[0][0]*g00 + I->m[0][1]*g01;
+    double C01 = I->m[0][0]*g01 + I->m[0][1]*g11;
+    double C10 = I->m[1][0]*g00 + I->m[1][1]*g01;
+    double C11 = I->m[1][0]*g01 + I->m[1][1]*g11;
+    (void)C10; /* C is symmetric: C10 == C01 in exact arithmetic. */
+
+    *S00 = 0.5 * (C00 - 1.0);
+    *S01 = 0.5 * C01;
+    *S11 = 0.5 * (C11 - 1.0);
+}
+
+/* Compute elastic energy. */
+double pamo_elastic_energy(const pamo_mesh *m, const pamo_vec3d *q,
+                           const pamo_elastic_rest *rest,
                            double young, double poisson) {
     double mu = young / (2.0 * (1.0 + poisson));
     double lambda = young * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson));
@@ -82,77 +97,90 @@ double pamo_elastic_energy(const pamo_mesh *m,
 
     double E = 0.0;
     for (size_t fi = 0; fi < m->n_faces; fi++) {
-        if (!m->face_alive[fi] || state[fi].rest_area < 1e-30) continue;
-        const int32_t *fv = m->faces[fi].v;
-        pamo_vec3d v0 = q[fv[0]], v1 = q[fv[1]], v2 = q[fv[2]];
-
-        pamo_vec3d e1 = pamo_v3_sub(v1, v0);
-        pamo_vec3d e2 = pamo_v3_sub(v2, v0);
-
-        /* Ds^T Ds (metric in current config). */
-        mat2 G;
-        G.m[0][0] = pamo_v3_dot(e1, e1);
-        G.m[0][1] = pamo_v3_dot(e1, e2);
-        G.m[1][0] = G.m[0][1];
-        G.m[1][1] = pamo_v3_dot(e2, e2);
-
-        /* C = inv_Dm^T * G * inv_Dm (right Cauchy-Green in 2D) */
-        /* Green strain: S = 0.5 * (C - I) */
-        /* For energy: just use metric approach. */
-        const mat2 *iD = &state[fi].inv_Dm;
-
-        /* C = iD^T * G * iD */
-        mat2 tmp, C;
-        /* tmp = G * iD */
-        tmp.m[0][0] = G.m[0][0]*iD->m[0][0] + G.m[0][1]*iD->m[1][0];
-        tmp.m[0][1] = G.m[0][0]*iD->m[0][1] + G.m[0][1]*iD->m[1][1];
-        tmp.m[1][0] = G.m[1][0]*iD->m[0][0] + G.m[1][1]*iD->m[1][0];
-        tmp.m[1][1] = G.m[1][0]*iD->m[0][1] + G.m[1][1]*iD->m[1][1];
-        /* C = iD^T * tmp */
-        C.m[0][0] = iD->m[0][0]*tmp.m[0][0] + iD->m[1][0]*tmp.m[1][0];
-        C.m[0][1] = iD->m[0][0]*tmp.m[0][1] + iD->m[1][0]*tmp.m[1][1];
-        C.m[1][0] = iD->m[0][1]*tmp.m[0][0] + iD->m[1][1]*tmp.m[1][0];
-        C.m[1][1] = iD->m[0][1]*tmp.m[0][1] + iD->m[1][1]*tmp.m[1][1];
-
-        /* Green strain: S = 0.5*(C - I) */
-        double S00 = 0.5 * (C.m[0][0] - 1.0);
-        double S01 = 0.5 * C.m[0][1];
-        double S11 = 0.5 * (C.m[1][1] - 1.0);
-
+        if (!m->face_alive[fi] || rest[fi].area < 1e-30) continue;
+        double S00, S01, S11;
+        green_strain(q, m->faces[fi].v, &rest[fi].inv_DtD, &S00, &S01, &S11);
         double trS = S00 + S11;
         double trSS = S00*S00 + 2.0*S01*S01 + S11*S11;
-
         double psi = mu * trSS + 0.5 * lambda * trS * trS;
-        E += state[fi].rest_area * psi;
+        E += rest[fi].area * psi;
     }
     return E;
 }
 
-/* Compute elastic gradient (accumulated into grad). */
-void pamo_elastic_gradient(const pamo_mesh *m,
-                           const pamo_vec3d *q,
-                           const pamo_elastic_tri_state *state,
-                           double young, double poisson,
-                           double *grad, double *hess_diag) {
-    double mu = young / (2.0 * (1.0 + poisson));
-    double lambda = young * poisson / ((1.0 + poisson) * (1.0 - 2.0 * poisson));
-    if (fabs(1.0 - 2.0 * poisson) < 1e-10) lambda = 0.0;
-
-    /* Finite-difference gradient for now (to be replaced with analytic). */
+/* Compute elastic gradient via finite differences.
+ * This is O(n_verts * n_faces) but correct and simple.
+ * For production use, replace with analytic gradient. */
+void pamo_elastic_gradient_fd(const pamo_mesh *m, pamo_vec3d *q,
+                              const pamo_elastic_rest *rest,
+                              double young, double poisson,
+                              double *grad) {
     double eps = 1e-7;
+    double E0 = pamo_elastic_energy(m, q, rest, young, poisson);
+
     for (size_t vi = 0; vi < m->n_verts; vi++) {
         if (!m->vert_alive[vi]) continue;
+        double *pos = &q[vi].x;
         for (int c = 0; c < 3; c++) {
-            /* We can't easily modify q here since it's const.
-             * Use the chain rule approach:
-             * dE/dq_i = 2 * stiffness * sum over incident tris of
-             *   area * dPsi/dq_i
-             * For a first implementation, use distance-like heuristic. */
+            double orig = pos[c];
+            pos[c] = orig + eps;
+            double Ep = pamo_elastic_energy(m, q, rest, young, poisson);
+            pos[c] = orig;
+            grad[vi * 3 + (size_t)c] += (Ep - E0) / eps;
         }
-        /* Simplified: use 2*mu as diagonal Hessian approximation. */
-        hess_diag[vi * 3 + 0] += 2.0 * mu;
-        hess_diag[vi * 3 + 1] += 2.0 * mu;
-        hess_diag[vi * 3 + 2] += 2.0 * mu;
     }
-    (void)grad; (void)q; (void)state; (void)lambda; (void)eps;
+}
+
+/* Compute elastic Hessian diagonal approximation. */
+void pamo_elastic_hess_diag(const pamo_mesh *m, const pamo_vec3d *q,
+                            const pamo_elastic_rest *rest,
+                            double young, double poisson,
+                            double *hess_diag) {
+    double mu = young / (2.0 * (1.0 + poisson));
+    /* Simple approximation: 2*mu per vertex, weighted by incident area. */
+    for (size_t fi = 0; fi < m->n_faces; fi++) {
+        if (!m->face_alive[fi] || rest[fi].area < 1e-30) continue;
+        double w = 2.0 * mu * rest[fi].area;
+        for (int k = 0; k < 3; k++) {
+            int32_t vi = m->faces[fi].v[k];
+            hess_diag[vi * 3 + 0] += w;
+            hess_diag[vi * 3 + 1] += w;
+            hess_diag[vi * 3 + 2] += w;
+        }
+    }
+    (void)q;
+}
+
+/* Hessian-vector product via finite differences. */
+void pamo_elastic_hess_vec_fd(const pamo_mesh *m, pamo_vec3d *q,
+                              const pamo_elastic_rest *rest,
+                              double young, double poisson,
+                              const double *dx, double *out) {
+    double eps = 1e-6;
+    size_t dim = m->n_verts * 3;
+    double *grad0 = (double *)calloc(dim, sizeof(double));
+    double *grad1 = (double *)calloc(dim, sizeof(double));
+    if (!grad0 || !grad1) { free(grad0); free(grad1); return; }
+
+    pamo_elastic_gradient_fd(m, q, rest, young, poisson, grad0);
+
+    /* Perturb: q + eps * dx. */
+    for (size_t i = 0; i < m->n_verts; i++) {
+        q[i].x += eps * dx[i * 3 + 0];
+        q[i].y += eps * dx[i * 3 + 1];
+        q[i].z += eps * dx[i * 3 + 2];
+    }
+    pamo_elastic_gradient_fd(m, q, rest, young, poisson, grad1);
+    /* Restore. */
+    for (size_t i = 0; i < m->n_verts; i++) {
+        q[i].x -= eps * dx[i * 3 + 0];
+        q[i].y -= eps * dx[i * 3 + 1];
+        q[i].z -= eps * dx[i * 3 + 2];
+    }
+
+    for (size_t i = 0; i < dim; i++) {
+        out[i] += (grad1[i] - grad0[i]) / eps;
+    }
+    free(grad0);
+    free(grad1);
 }

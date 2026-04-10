@@ -3,14 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Stage 3: SAFE projection driver.
- *
- * Optimizes the simplified mesh vertices to minimize a combination of:
- *   - mesh-to-GT distance (BVH nearest)
- *   - elastic deformation energy (SVK)
- *   - hinge bending energy
- *   - collision barrier (stub)
- *
- * Uses matrix-free Newton with Jacobi-preconditioned CG.
  */
 #include "pamo/pamo_stage3.h"
 #include "pamo/pamo_bvh.h"
@@ -18,6 +10,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* Forward declarations from energy modules. */
 double pamo_distance_energy(const pamo_vec3d *q, size_t n,
@@ -31,7 +24,27 @@ pamo_error pamo_distance_update_targets(const pamo_vec3d *q, size_t n,
                                         const pamo_mesh *gt, const pamo_bvh *bvh,
                                         pamo_vec3d *targets);
 
-/* CG solver forward declaration. */
+/* Elastic energy forward declarations. */
+typedef struct { double m[2][2]; } pamo_elastic_rest_mat2;
+typedef struct { pamo_elastic_rest_mat2 inv_DtD; double area; } pamo_elastic_rest;
+
+void   pamo_elastic_precompute(const pamo_mesh *m, const pamo_vec3d *rest,
+                               pamo_elastic_rest *state);
+double pamo_elastic_energy(const pamo_mesh *m, const pamo_vec3d *q,
+                           const pamo_elastic_rest *state,
+                           double young, double poisson);
+void   pamo_elastic_gradient_fd(const pamo_mesh *m, pamo_vec3d *q,
+                                const pamo_elastic_rest *state,
+                                double young, double poisson, double *grad);
+void   pamo_elastic_hess_diag(const pamo_mesh *m, const pamo_vec3d *q,
+                              const pamo_elastic_rest *state,
+                              double young, double poisson, double *hdiag);
+void   pamo_elastic_hess_vec_fd(const pamo_mesh *m, pamo_vec3d *q,
+                                const pamo_elastic_rest *state,
+                                double young, double poisson,
+                                const double *dx, double *out);
+
+/* CG solver. */
 typedef void (*pamo_hess_vec_fn)(const double *dx, double *out,
                                  size_t n, void *ctx);
 pamo_error pamo_cg_solve(pamo_hess_vec_fn hess_vec,
@@ -42,15 +55,16 @@ pamo_error pamo_cg_solve(pamo_hess_vec_fn hess_vec,
 /* ── SAFE system context ─────────────────────────────────────────── */
 
 typedef struct {
-    pamo_mesh      *mesh;
-    const pamo_mesh *gt_mesh;
-    pamo_bvh        gt_bvh;
-    pamo_vec3d     *targets;
-    pamo_safe_opts  opts;
+    pamo_mesh         *mesh;
+    const pamo_mesh   *gt_mesh;
+    pamo_bvh           gt_bvh;
+    pamo_vec3d        *targets;
+    pamo_vec3d        *rest_verts;
+    pamo_elastic_rest *elastic_rest;
+    pamo_safe_opts     opts;
     const pamo_allocator *alloc;
 } pamo_safe_ctx;
 
-/* Hessian-vector product callback for CG. */
 static void safe_hess_vec(const double *dx, double *out,
                           size_t n, void *ctx_ptr) {
     pamo_safe_ctx *ctx = (pamo_safe_ctx *)ctx_ptr;
@@ -60,11 +74,12 @@ static void safe_hess_vec(const double *dx, double *out,
     pamo_distance_hess_vec(ctx->mesh->verts, n, dx, out,
                            ctx->opts.dist_stiffness);
 
-    /* Elastic: H*dx ≈ 2*mu*dx (diagonal approximation for now). */
-    double mu = ctx->opts.elas_young_modulus / (2.0 * (1.0 + ctx->opts.elas_poisson_ratio));
-    for (size_t i = 0; i < n * 3; i++) {
-        out[i] += 2.0 * mu * dx[i];
-    }
+    /* Elastic Hessian-vector product (finite differences). */
+    pamo_elastic_hess_vec_fd(ctx->mesh, ctx->mesh->verts,
+                             ctx->elastic_rest,
+                             ctx->opts.elas_young_modulus,
+                             ctx->opts.elas_poisson_ratio,
+                             dx, out);
 }
 
 /* ── Defaults ────────────────────────────────────────────────────── */
@@ -90,18 +105,28 @@ pamo_safe_opts pamo_safe_opts_default(void) {
     };
 }
 
+/* Compute total energy. */
+static double total_energy(pamo_safe_ctx *ctx) {
+    double E = 0.0;
+    E += pamo_distance_energy(ctx->mesh->verts, ctx->mesh->n_verts,
+                              ctx->targets, ctx->opts.dist_stiffness);
+    E += pamo_elastic_energy(ctx->mesh, ctx->mesh->verts,
+                             ctx->elastic_rest,
+                             ctx->opts.elas_young_modulus,
+                             ctx->opts.elas_poisson_ratio);
+    return E;
+}
+
 /* ── Main SAFE projection ────────────────────────────────────────── */
 
 pamo_error pamo_safe_project(pamo_mesh *mesh, const pamo_mesh *gt_mesh,
                              const pamo_safe_opts *opts,
                              const pamo_allocator *alloc) {
-    if (!mesh || !gt_mesh || !opts || !alloc)
-        return PAMO_ERR_INVALID_ARG;
+    if (!mesh || !gt_mesh || !opts || !alloc) return PAMO_ERR_INVALID_ARG;
 
     size_t n = mesh->n_verts;
     size_t dim = n * 3;
 
-    /* Build GT BVH. */
     pamo_safe_ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.mesh = mesh;
@@ -112,70 +137,73 @@ pamo_error pamo_safe_project(pamo_mesh *mesh, const pamo_mesh *gt_mesh,
     pamo_error err = pamo_bvh_build_triangles(&ctx.gt_bvh, gt_mesh, alloc);
     if (err != PAMO_OK) return err;
 
-    /* Allocate working arrays. */
-    ctx.targets   = PAMO_ALLOC_ARRAY(alloc, pamo_vec3d, n);
+    /* Allocate. */
+    ctx.targets      = PAMO_ALLOC_ARRAY(alloc, pamo_vec3d, n);
+    ctx.rest_verts   = PAMO_ALLOC_ARRAY(alloc, pamo_vec3d, n);
+    ctx.elastic_rest = (pamo_elastic_rest *)pamo_alloc(alloc,
+                        mesh->n_faces * sizeof(pamo_elastic_rest));
     double *grad  = (double *)pamo_alloc(alloc, dim * sizeof(double));
     double *hdiag = (double *)pamo_alloc(alloc, dim * sizeof(double));
     double *p     = (double *)pamo_alloc(alloc, dim * sizeof(double));
-    if (!ctx.targets || !grad || !hdiag || !p) {
+
+    if (!ctx.targets || !ctx.rest_verts || !ctx.elastic_rest ||
+        !grad || !hdiag || !p) {
         err = PAMO_ERR_ALLOC;
         goto cleanup;
     }
 
-    for (int32_t outer = 0; outer < opts->n_outer_iters; outer++) {
-        fprintf(stderr, "SAFE outer iter %d/%d\n", outer + 1,
-                opts->n_outer_iters);
+    /* Save rest positions and precompute elastic rest state. */
+    memcpy(ctx.rest_verts, mesh->verts, n * sizeof(pamo_vec3d));
+    pamo_elastic_precompute(mesh, ctx.rest_verts, ctx.elastic_rest);
 
+    for (int32_t outer = 0; outer < opts->n_outer_iters; outer++) {
         /* Update closest-point targets. */
         err = pamo_distance_update_targets(mesh->verts, n, gt_mesh,
                                            &ctx.gt_bvh, ctx.targets);
         if (err != PAMO_OK) goto cleanup;
 
         for (int32_t newton = 0; newton < opts->n_newton_iters; newton++) {
-            /* Compute gradient and Hessian diagonal. */
             memset(grad, 0, dim * sizeof(double));
-            /* Initialize Hessian diagonal with small positive value. */
             for (size_t i = 0; i < dim; i++) hdiag[i] = 1e-8;
 
             /* Distance energy gradient. */
             pamo_distance_gradient(mesh->verts, n, ctx.targets,
                                    opts->dist_stiffness, grad, hdiag);
 
-            /* Elastic: simplified gradient = 0 at rest (mesh is already
-             * close to rest state after stage 2). Hessian diagonal added
-             * in the gradient function above. */
-            double mu = opts->elas_young_modulus /
-                       (2.0 * (1.0 + opts->elas_poisson_ratio));
-            for (size_t i = 0; i < dim; i++) hdiag[i] += 2.0 * mu;
+            /* Elastic gradient (finite differences). */
+            pamo_elastic_gradient_fd(mesh, mesh->verts, ctx.elastic_rest,
+                                     opts->elas_young_modulus,
+                                     opts->elas_poisson_ratio, grad);
+            pamo_elastic_hess_diag(mesh, mesh->verts, ctx.elastic_rest,
+                                   opts->elas_young_modulus,
+                                   opts->elas_poisson_ratio, hdiag);
 
-            /* CG solve: H*p = -grad */
+            /* CG solve: H * p = -grad */
             memset(p, 0, dim * sizeof(double));
             err = pamo_cg_solve(safe_hess_vec, hdiag, grad, p, n,
                                 opts->n_cg_iters, &ctx, alloc);
             if (err != PAMO_OK) goto cleanup;
 
-            /* Line search: simple step halving. */
-            double alpha = 1.0;
+            /* Line search. */
             double gp = 0.0;
             for (size_t i = 0; i < dim; i++) gp += grad[i] * p[i];
-            if (gp >= 0.0) continue; /* not a descent direction */
+            if (gp >= 0.0) continue;
 
-            double E0 = pamo_distance_energy(mesh->verts, n, ctx.targets,
-                                             opts->dist_stiffness);
+            double E0 = total_energy(&ctx);
+            double alpha = 1.0;
+            bool stepped = false;
 
             for (int ls = 0; ls < opts->n_line_search_iters; ls++) {
-                /* Try step: q_trial = q + alpha * p */
                 for (size_t i = 0; i < n; i++) {
                     mesh->verts[i].x += alpha * p[i * 3 + 0];
                     mesh->verts[i].y += alpha * p[i * 3 + 1];
                     mesh->verts[i].z += alpha * p[i * 3 + 2];
                 }
 
-                double E1 = pamo_distance_energy(mesh->verts, n, ctx.targets,
-                                                 opts->dist_stiffness);
-
+                double E1 = total_energy(&ctx);
                 if (E1 < E0 + 1e-4 * alpha * gp) {
-                    break; /* Armijo satisfied */
+                    stepped = true;
+                    break;
                 }
 
                 /* Revert. */
@@ -187,16 +215,26 @@ pamo_error pamo_safe_project(pamo_mesh *mesh, const pamo_mesh *gt_mesh,
                 alpha *= 0.5;
             }
 
-            /* Apply final step if not already applied. */
-            if (alpha < 1.0 / (1 << opts->n_line_search_iters)) {
-                /* Step too small, skip. */
-                continue;
+            if (!stepped && alpha > 1e-10) {
+                /* Apply with smallest alpha anyway. */
+                for (size_t i = 0; i < n; i++) {
+                    mesh->verts[i].x += alpha * p[i * 3 + 0];
+                    mesh->verts[i].y += alpha * p[i * 3 + 1];
+                    mesh->verts[i].z += alpha * p[i * 3 + 2];
+                }
             }
         }
+
+        double E = total_energy(&ctx);
+        fprintf(stderr, "  SAFE outer %d: energy=%.6e\n", outer + 1, E);
     }
 
 cleanup:
     if (ctx.targets) PAMO_FREE_ARRAY(alloc, ctx.targets, pamo_vec3d, n);
+    if (ctx.rest_verts) PAMO_FREE_ARRAY(alloc, ctx.rest_verts, pamo_vec3d, n);
+    if (ctx.elastic_rest)
+        pamo_free(alloc, ctx.elastic_rest,
+                  mesh->n_faces * sizeof(pamo_elastic_rest));
     if (grad)  pamo_free(alloc, grad,  dim * sizeof(double));
     if (hdiag) pamo_free(alloc, hdiag, dim * sizeof(double));
     if (p)     pamo_free(alloc, p,     dim * sizeof(double));

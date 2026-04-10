@@ -4,7 +4,7 @@ Two build scripts are provided depending on your CUDA version:
 
 | Script | CUDA | Venv | Stage 3 |
 |--------|------|------|---------|
-| `setup_uv.sh` | 13.x (`cu130`) | `.venv` | Stages 1+2 only |
+| `setup_uv.sh` | 13.x (`cu130`) | `.venv` | All 3 stages |
 | `setup_uv_cuda12.sh` | 12.9 (`cu129`) | `.venv-cuda12` | All 3 stages |
 
 ## Prerequisites
@@ -26,7 +26,7 @@ Two build scripts are provided depending on your CUDA version:
 
 ## Quick Start
 
-### CUDA 13.x (Stages 1+2 only)
+### CUDA 13.x (All 3 stages)
 
 ```bash
 ./setup_uv.sh
@@ -51,7 +51,7 @@ source .venv-cuda12/bin/activate
 7. **Stage 2 (Simplification)**: Build the CUDA extension in `simp_cuda/`
 8. **Stage 3 (Safe Projection)**: Install `pamo_safe_project`
    - CUDA 12: builds the custom warp fork (`simp_cuda/safe_project/warp_`) from source
-   - CUDA 13: installs upstream `warp-lang` from PyPI (Stage 3 does not fully work)
+   - CUDA 13: installs upstream `warp-lang` from PyPI (Stage 3 works via pure warp backport)
 
 ## Environment Variables
 
@@ -95,15 +95,32 @@ Stage 3 pre-allocates large GPU buffers (`max_blocks = 2^25`). On GPUs with less
 - **Stage 1 (Remeshing)**: Fully working
 - **Stage 2 (Simplification)**: Fully working (with CCCL include path fix in
   `simp_cuda/setup.py`)
+- **Stage 3 (Safe Projection)**: Fully working (with pure warp backport of
+  `wp.spd_project_blocks` and `wp.select` → `wp.where` migration)
 
-### What does not work on CUDA 13
+### Source-level compatibility shims
 
-**Stage 3 (Safe Projection)** requires the custom warp fork
-([Rabbit-Hu/warp](https://github.com/Rabbit-Hu/warp), pinned at warp 1.0.0-beta.2)
-which adds `wp.spd_project_blocks` -- a custom built-in function for SPD matrix
-projection. This function does not exist in any official `warp-lang` release.
+The following changes in `pamo_safe_project` allow the same source to work with both
+the warp fork (1.0.0-beta.2) and upstream warp-lang (1.12+):
 
-The custom fork cannot compile against CUDA 13 due to:
+- **`wp.select()` → `wp.where()`**: All `wp.select(cond, val_if_false, val_if_true)`
+  calls replaced with `wp.where(cond, val_if_true, val_if_false)` (note: argument
+  order is swapped). Affected files: `distance_kernels/grad_funcs.py`,
+  `distance_kernels/grad_funcs_struct.py`, `energy_kernels/collision_energy.py`
+- **`wp.spd_project_blocks` backport**: The custom warp built-in for SPD matrix
+  projection (only in the Rabbit-Hu/warp fork) is replaced by a pure warp
+  `@wp.func` implementation in `kernels/spd_project.py`. Uses Jacobi eigenvalue
+  iteration on 9x9 matrices, clamps negative eigenvalues to zero, and reconstructs.
+  First compilation takes ~35s but is cached for subsequent runs.
+- **`owner` parameter**: `wp_slice()` in `utils.py` conditionally passes the `owner`
+  parameter only when the warp version supports it
+- **CCCL include path**: `simp_cuda/setup.py` auto-detects and adds the
+  `include/cccl/` path for CUDA 13+ thrust/cub headers
+
+### Historical: custom warp fork limitations on CUDA 13
+
+The custom warp fork ([Rabbit-Hu/warp](https://github.com/Rabbit-Hu/warp), pinned at
+warp 1.0.0-beta.2) cannot compile against CUDA 13 due to:
 
 - **CCCL header reorganization**: `cub/` and `thrust/` headers moved under
   `include/cccl/` (partially fixable by adding include paths)
@@ -112,14 +129,5 @@ The custom fork cannot compile against CUDA 13 due to:
 - **Removed CUDA typedefs**: `PFN_cuGetProcAddress` unversioned typedef removed
 - **Dropped GPU architectures**: `compute_52` through `compute_70` no longer supported
 
-### Source-level compatibility shims
-
-The following changes in `pamo_safe_project` allow the same source to work with both
-the warp fork (1.0.0-beta.2) and upstream warp-lang (1.12+):
-
-- **`wp.select()` compat**: A shim in `__init__.py` aliases `wp.where` to `wp.select`
-  when running on newer warp versions that removed `wp.select`
-- **`owner` parameter**: `wp_slice()` in `utils.py` conditionally passes the `owner`
-  parameter only when the warp version supports it
-- **CCCL include path**: `simp_cuda/setup.py` auto-detects and adds the
-  `include/cccl/` path for CUDA 13+ thrust/cub headers
+These issues are no longer blockers since the pure warp backport eliminates the need
+for the custom fork on CUDA 13.

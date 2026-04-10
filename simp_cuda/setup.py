@@ -47,6 +47,11 @@ def get_extensions():
         }
     sources = [os.path.join(extensions_dir, s) for s in sources]
     include_dirs = [extensions_dir, os.path.join(extensions_dir, "include")]
+    # CUDA 13+ moved thrust/cub headers under cccl/
+    if CUDA_HOME is not None:
+        cccl_include = os.path.join(CUDA_HOME, "include", "cccl")
+        if os.path.isdir(cccl_include):
+            include_dirs.append(cccl_include)
     print("sources:", sources)
 
     ext_modules = [

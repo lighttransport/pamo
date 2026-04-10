@@ -25,7 +25,6 @@ def wp_slice(a: wp.array, start, end):
         strides=a.strides,
         device=a.device,
         copy=False,
-        owner=False,
     )
     
 

@@ -18,7 +18,7 @@ def wp_slice(a: wp.array, start, end):
 
     assert a.is_contiguous
     assert 0 <= start <= end <= a.shape[0]
-    return wp.array(
+    kwargs = dict(
         ptr=a.ptr + start * a.strides[0],
         dtype=a.dtype,
         shape=(end - start, *a.shape[1:]),
@@ -26,6 +26,11 @@ def wp_slice(a: wp.array, start, end):
         device=a.device,
         copy=False,
     )
+    # warp 1.0.x fork accepts owner=, newer warp removed it
+    import inspect
+    if "owner" in inspect.signature(wp.array.__init__).parameters:
+        kwargs["owner"] = False
+    return wp.array(**kwargs)
     
 
 def convert_to_wp_array(

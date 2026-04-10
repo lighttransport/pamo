@@ -1,49 +1,70 @@
-# Building PaMO with uv (setup_uv.sh)
+# Building PaMO with uv
+
+Two build scripts are provided depending on your CUDA version:
+
+| Script | CUDA | Venv | Stage 3 |
+|--------|------|------|---------|
+| `setup_uv.sh` | 13.x (`cu130`) | `.venv` | Stages 1+2 only |
+| `setup_uv_cuda12.sh` | 12.9 (`cu129`) | `.venv-cuda12` | All 3 stages |
 
 ## Prerequisites
 
 - Linux x86_64
-- NVIDIA GPU with CUDA toolkit installed (`/usr/local/cuda`)
+- NVIDIA GPU with CUDA toolkit installed
 - [uv](https://docs.astral.sh/uv/) package manager
   ```
   curl -LsSf https://astral.sh/uv/install.sh | sh
   ```
 
+### For CUDA 12.9 (Stage 3 support)
+
+- CUDA 12.9 toolkit (e.g. `/usr/local/cuda-12.9`)
+- `cuda-nvrtc-dev` package for your CUDA version:
+  ```
+  sudo apt install cuda-nvrtc-dev-12-9
+  ```
+
 ## Quick Start
+
+### CUDA 13.x (Stages 1+2 only)
 
 ```bash
 ./setup_uv.sh
 source .venv/bin/activate
 ```
 
-## What the Script Does
+### CUDA 12.9 (All 3 stages)
 
-1. Installs Python 3.12 via `uv python install`
-2. Creates a virtual environment in `.venv`
-3. Installs PyTorch with CUDA 13.0 wheels (`cu130`)
-4. Installs base dependencies (numpy, libigl, trimesh, scipy, networkx, warp-lang)
-5. **Stage 1 (Remeshing)**: Installs `cumesh2sdf` and `pdmc`
-6. **Stage 2 (Simplification)**: Builds the CUDA extension in `simp_cuda/`
-7. **Stage 3 (Safe Projection)**: Installs `pamo_safe_project`
+```bash
+./setup_uv_cuda12.sh
+source .venv-cuda12/bin/activate
+```
+
+## What the Scripts Do
+
+1. Initialize git submodules (CUDA 12 script only, for the warp fork)
+2. Install Python 3.12 via `uv python install`
+3. Create a virtual environment
+4. Install PyTorch with appropriate CUDA wheels
+5. Install base dependencies (numpy, libigl, trimesh, scipy, networkx)
+6. **Stage 1 (Remeshing)**: Install `cumesh2sdf` and `pdmc`
+7. **Stage 2 (Simplification)**: Build the CUDA extension in `simp_cuda/`
+8. **Stage 3 (Safe Projection)**: Install `pamo_safe_project`
+   - CUDA 12: builds the custom warp fork (`simp_cuda/safe_project/warp_`) from source
+   - CUDA 13: installs upstream `warp-lang` from PyPI (Stage 3 does not fully work)
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PYTHON_VERSION` | `3.12` | Python version to install |
-| `VENV_DIR` | `.venv` | Virtual environment directory |
-| `CUDA_PATH` | `/usr/local/cuda` | Path to CUDA toolkit |
-
-Example with custom settings:
-
-```bash
-PYTHON_VERSION=3.12 CUDA_PATH=/usr/local/cuda-13.1 ./setup_uv.sh
-```
+| Variable | Default (CUDA 13) | Default (CUDA 12) | Description |
+|----------|-------------------|--------------------|-------------|
+| `PYTHON_VERSION` | `3.12` | `3.12` | Python version to install |
+| `VENV_DIR` | `.venv` | `.venv-cuda12` | Virtual environment directory |
+| `CUDA_PATH` | `/usr/local/cuda` | `/usr/local/cuda-12.9` | Path to CUDA toolkit |
 
 ## Running the Demo
 
 ```bash
-source .venv/bin/activate
+source .venv-cuda12/bin/activate   # or .venv for CUDA 13
 mkdir -p examples
 python example.py --input ./mesh/BirdHouse_B019SXLRJ2_MetalLeafRoofGreenWalls_TU.obj \
                   --output ./examples/BirdHouse.obj --ratio 0.001
@@ -62,48 +83,43 @@ python example.py --input ./mesh/BirdHouse_B019SXLRJ2_MetalLeafRoofGreenWalls_TU
                   --output ./examples/BirdHouse.obj --ratio 0.001 --disable_stage3
 ```
 
-## CUDA 13 Compatibility Fixes
+### Stage 3 memory note
 
-The following source-level fixes were applied for CUDA 13.x support:
+Stage 3 pre-allocates large GPU buffers (`max_blocks = 2^25`). On GPUs with less than
+16 GB VRAM, this may cause OOM errors. The default settings target 16+ GB GPUs.
 
-### simp_cuda/setup.py
+## CUDA 13 Compatibility Notes
 
-CUDA 13 moved thrust/cub/libcudacxx headers under `include/cccl/`. The CCCL include
-path is automatically added when detected.
+### What works on CUDA 13
 
-### simp_cuda/safe_project (pamo_safe_project)
+- **Stage 1 (Remeshing)**: Fully working
+- **Stage 2 (Simplification)**: Fully working (with CCCL include path fix in
+  `simp_cuda/setup.py`)
 
-- **`wp.select()` replaced with `wp.where()`**: The `wp.select()` API was removed in
-  warp-lang 1.8+.
-- **`owner` parameter removed from `wp.array()`**: The `owner=False` keyword argument
-  was removed in newer warp-lang versions.
+### What does not work on CUDA 13
 
-## Stage 3 Limitations on CUDA 13
-
-Stage 3 (Safe Projection) **does not fully work** with CUDA 13 + upstream `warp-lang`.
-
-The original project uses a custom warp fork
+**Stage 3 (Safe Projection)** requires the custom warp fork
 ([Rabbit-Hu/warp](https://github.com/Rabbit-Hu/warp), pinned at warp 1.0.0-beta.2)
 which adds `wp.spd_project_blocks` -- a custom built-in function for SPD matrix
-projection used by the collision energy solver. This function does not exist in any
-official `warp-lang` release.
+projection. This function does not exist in any official `warp-lang` release.
 
-The custom fork itself cannot compile against CUDA 13 due to:
+The custom fork cannot compile against CUDA 13 due to:
 
 - **CCCL header reorganization**: `cub/` and `thrust/` headers moved under
   `include/cccl/` (partially fixable by adding include paths)
-- **Removed CUB APIs**: `cub::CountingInputIterator` was removed entirely in CCCL 2.x
+- **Removed CUB APIs**: `cub::CountingInputIterator` removed entirely in CCCL 2.x
   shipped with CUDA 13 (requires code rewrite)
 - **Removed CUDA typedefs**: `PFN_cuGetProcAddress` unversioned typedef removed
-  (fixable with `decltype`)
-- **Dropped GPU architectures**: `compute_52` through `compute_70` are no longer
-  supported (fixable by updating gencode list)
+- **Dropped GPU architectures**: `compute_52` through `compute_70` no longer supported
 
-### Workarounds
+### Source-level compatibility shims
 
-- **Use `--disable_stage3`** to run Stages 1+2 only (remeshing + simplification).
-  These work correctly on CUDA 13.
-- **Use CUDA 12.x** if Stage 3 is required. The original `setup.sh` with conda
-  targets CUDA 12.x where the custom warp fork compiles successfully.
-- **Port the fork**: To enable Stage 3 on CUDA 13, the custom warp fork needs to be
-  updated for CCCL 2.x compatibility (mainly replacing removed CUB iterators).
+The following changes in `pamo_safe_project` allow the same source to work with both
+the warp fork (1.0.0-beta.2) and upstream warp-lang (1.12+):
+
+- **`wp.select()` compat**: A shim in `__init__.py` aliases `wp.where` to `wp.select`
+  when running on newer warp versions that removed `wp.select`
+- **`owner` parameter**: `wp_slice()` in `utils.py` conditionally passes the `owner`
+  parameter only when the warp version supports it
+- **CCCL include path**: `simp_cuda/setup.py` auto-detects and adds the
+  `include/cccl/` path for CUDA 13+ thrust/cub headers

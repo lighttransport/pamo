@@ -143,10 +143,11 @@ int main(int argc, char **argv) {
     /* Stage 1: Remeshing */
     if (stage1) {
         pamo_remesh_opts ropts = pamo_remesh_opts_default();
-        /* Adapt resolution to mesh size. */
+        /* Adapt resolution: cumesh2sdf uses R=256 but with narrow-band
+         * rasterization. Our full-grid approach is too expensive at R=256
+         * for large meshes. Use R=128 as default. */
         if (mesh.n_faces <= 50) ropts.resolution = 64;
-        else if (mesh.n_faces <= 1000) ropts.resolution = 128;
-        else ropts.resolution = 256;
+        else ropts.resolution = 128;
 
         fprintf(stderr, "Running Stage 1: remesh (R=%d)...\n", ropts.resolution);
         pamo_mesh remeshed;

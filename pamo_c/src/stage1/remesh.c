@@ -76,7 +76,8 @@ pamo_error pamo_remesh(pamo_mesh *out, const pamo_mesh *in,
         return err;
     }
 
-    /* Offset SDF inward: sdf = sdf - 0.9/R */
+    /* Offset SDF inward: sdf = sdf - 0.9/R
+     * This shifts the isosurface slightly inside the original mesh. */
     double offset = 0.9 / (double)R * (2.0 * half_size);
     for (size_t i = 0; i < grid_size; i++) {
         sdf[i] -= offset;

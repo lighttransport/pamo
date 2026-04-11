@@ -9,6 +9,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 /* Forward declarations from sdf.c and dual_mc.c */
 pamo_error pamo_compute_sdf(double *grid, int32_t R,
@@ -90,10 +91,61 @@ pamo_error pamo_remesh(pamo_mesh *out, const pamo_mesh *in,
     fprintf(stderr, "Stage 1: extracted %zu verts, %zu faces\n",
             out->n_verts, out->n_faces);
 
-    /* Note: DMC may produce a small number of non-manifold edges
-     * at saddle points (~0.01%). These are left as-is since the
-     * Stage 2 link condition check handles them correctly. The mesh
-     * has 0 boundary edges (watertight) before simplification. */
+    /* Post-process: resolve non-manifold edges by edge collapse.
+     * For each edge shared by >2 faces, collapse it (merge v into u)
+     * which eliminates the nm edge. Shared faces become degenerate
+     * and are removed. This preserves watertightness. */
+    /* Iterate until no nm edges remain. */
+    for (int nm_pass = 0; nm_pass < 5; nm_pass++) {
+    err = pamo_mesh_build_adjacency(out);
+    if (err != PAMO_OK) break;
+    if (!out->edge_face_offset) break;
+    {
+        int32_t nm_count = 0;
+        for (size_t ei = 0; ei < out->n_edges; ei++) {
+            int32_t cnt = out->edge_face_offset[ei+1] - out->edge_face_offset[ei];
+            if (cnt > 2) nm_count++;
+        }
+
+        if (nm_count > 0) {
+            fprintf(stderr, "Stage 1: resolving %d non-manifold edges via collapse\n",
+                    nm_count);
+
+            for (size_t ei = 0; ei < out->n_edges; ei++) {
+                int32_t cnt = out->edge_face_offset[ei+1] - out->edge_face_offset[ei];
+                if (cnt <= 2) continue;
+
+                int32_t u = out->edges[ei].u;
+                int32_t v = out->edges[ei].v;
+                if (!out->vert_alive[u] || !out->vert_alive[v]) continue;
+
+                /* Merge v into u: move u to midpoint, remap all v refs. */
+                out->verts[u] = pamo_v3_scale(
+                    pamo_v3_add(out->verts[u], out->verts[v]), 0.5);
+                out->vert_alive[v] = false;
+
+                /* Remap v -> u in all faces. */
+                for (size_t fi = 0; fi < out->n_faces; fi++) {
+                    if (!out->face_alive[fi]) continue;
+                    int32_t *fv = out->faces[fi].v;
+                    for (int k = 0; k < 3; k++) {
+                        if (fv[k] == v) fv[k] = u;
+                    }
+                    /* Remove degenerate faces. */
+                    if (fv[0] == fv[1] || fv[1] == fv[2] || fv[2] == fv[0]) {
+                        out->face_alive[fi] = false;
+                    }
+                }
+            }
+
+            pamo_mesh_free_adjacency(out);
+            pamo_mesh_compact(out);
+        } else {
+            pamo_mesh_free_adjacency(out);
+            break; /* no nm edges, done */
+        }
+    }
+    } /* end nm_pass loop */
 
     return PAMO_OK;
 }

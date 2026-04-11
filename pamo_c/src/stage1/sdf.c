@@ -85,7 +85,57 @@ pamo_error pamo_compute_sdf(double *grid, int32_t R,
                             const pamo_mesh *m, const pamo_bvh *bvh) {
     size_t grid_size = (size_t)R * (size_t)R * (size_t)R;
 
-    /* ── Phase 1: Unsigned distances via BVH ─────────────────────── */
+    /* ── Phase 1: Unsigned distances ────────────────────────────── */
+#ifdef PAMO_USE_LIGHTRT
+    /* Fast path: use lightrt queryNearest (SIMD-optimized BVH). */
+    {
+        /* Build lightrt BVH for nearest queries. */
+        float *fverts = (float *)malloc(m->n_verts * 3 * sizeof(float));
+        int32_t *ifaces = (int32_t *)malloc(m->n_faces * 3 * sizeof(int32_t));
+        int32_t *vert_remap = (int32_t *)malloc(m->n_verts * sizeof(int32_t));
+        if (!fverts || !ifaces || !vert_remap) {
+            free(fverts); free(ifaces); free(vert_remap);
+            return PAMO_ERR_ALLOC;
+        }
+        int32_t av = 0, af = 0;
+        for (size_t i = 0; i < m->n_verts; i++) {
+            if (m->vert_alive[i]) {
+                fverts[av*3+0] = (float)m->verts[i].x;
+                fverts[av*3+1] = (float)m->verts[i].y;
+                fverts[av*3+2] = (float)m->verts[i].z;
+                vert_remap[i] = av++;
+            } else vert_remap[i] = -1;
+        }
+        for (size_t i = 0; i < m->n_faces; i++) {
+            if (!m->face_alive[i]) continue;
+            ifaces[af*3+0] = vert_remap[m->faces[i].v[0]];
+            ifaces[af*3+1] = vert_remap[m->faces[i].v[1]];
+            ifaces[af*3+2] = vert_remap[m->faces[i].v[2]];
+            af++;
+        }
+        free(vert_remap);
+
+        lightrt_bvh *lbvh_dist = lightrt_bvh_build(fverts, av, ifaces, af);
+        free(fverts); free(ifaces);
+        if (!lbvh_dist) return PAMO_ERR_ALLOC;
+
+        for (int32_t iz = 0; iz < R; iz++) {
+            for (int32_t iy = 0; iy < R; iy++) {
+                for (int32_t ix = 0; ix < R; ix++) {
+                    float p[3] = {
+                        (float)(grid_origin.x + ((double)ix + 0.5) * voxel_size),
+                        (float)(grid_origin.y + ((double)iy + 0.5) * voxel_size),
+                        (float)(grid_origin.z + ((double)iz + 0.5) * voxel_size),
+                    };
+                    float dsq = lightrt_bvh_nearest_dist_sq(lbvh_dist, p);
+                    grid[GRID_IDX(ix, iy, iz, R)] = sqrt((double)dsq);
+                }
+            }
+        }
+        lightrt_bvh_destroy(lbvh_dist);
+    }
+#else
+    /* Fallback: pamo BVH nearest-point queries. */
     for (int32_t iz = 0; iz < R; iz++) {
         for (int32_t iy = 0; iy < R; iy++) {
             for (int32_t ix = 0; ix < R; ix++) {
@@ -100,6 +150,7 @@ pamo_error pamo_compute_sdf(double *grid, int32_t R,
             }
         }
     }
+#endif
 
     /* ── Phase 2: Sign via Z-scanline parity ─────────────────────── */
     /* For each (ix, iy) column, cast a ray in +Z direction from below

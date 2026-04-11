@@ -128,4 +128,14 @@ int32_t lightrt_bvh_multi_hit(const lightrt_bvh *bvh,
     return count;
 }
 
+/* Nearest distance query: find distance to closest triangle.
+ * Returns squared distance. point: float[3]. */
+float lightrt_bvh_nearest_dist_sq(const lightrt_bvh *bvh,
+                                   const float *point) {
+    const auto *b = reinterpret_cast<const lightrt::TriangleBVH *>(bvh);
+    float dist_sq = std::numeric_limits<float>::infinity();
+    b->queryNearest(lightrt::Vec3(point[0], point[1], point[2]), dist_sq);
+    return dist_sq;
+}
+
 } /* extern "C" */

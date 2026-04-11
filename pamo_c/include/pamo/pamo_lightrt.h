@@ -49,6 +49,10 @@ int32_t lightrt_bvh_multi_hit(const lightrt_bvh *bvh,
                                float tmax,
                                float *out_t, int32_t max_hits);
 
+/* Nearest distance query.  Returns squared distance to closest triangle. */
+float lightrt_bvh_nearest_dist_sq(const lightrt_bvh *bvh,
+                                   const float *point);
+
 #ifdef __cplusplus
 }
 #endif

@@ -25,9 +25,10 @@ static double orient_tri(pamo_vec3d v0, pamo_vec3d v1, pamo_vec3d v2,
 static void compute_interval(double p0, double p1, double p2,
                              double d0, double d1, double d2,
                              double *t0, double *t1) {
-    /* Edge v0-v1 crosses plane at parameter t = p0 + (p1-p0)*d0/(d0-d1) */
-    double a = p0 + (p1 - p0) * d0 / (d0 - d1);
-    double b = p0 + (p2 - p0) * d0 / (d0 - d2);
+    double denom01 = d0 - d1;
+    double denom02 = d0 - d2;
+    double a = (fabs(denom01) > 1e-15) ? p0 + (p1 - p0) * d0 / denom01 : p0;
+    double b = (fabs(denom02) > 1e-15) ? p0 + (p2 - p0) * d0 / denom02 : p0;
     if (a > b) { double tmp = a; a = b; b = tmp; }
     *t0 = a;
     *t1 = b;

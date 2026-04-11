@@ -86,7 +86,13 @@ pamo_vec3d pamo_closest_point_on_tri(pamo_vec3d p,
         return r;
     }
 
-    double denom = 1.0 / (va + vb + vc);
+    double denom_sum = va + vb + vc;
+    if (fabs(denom_sum) < 1e-30) {
+        /* Degenerate triangle: return v0. */
+        if (dist_sq) *dist_sq = pamo_v3_length_sq(pamo_v3_sub(p, v0));
+        return v0;
+    }
+    double denom = 1.0 / denom_sum;
     double sv = vb * denom;
     double tv = vc * denom;
     pamo_vec3d r = pamo_v3_add(v0, pamo_v3_add(pamo_v3_scale(ab, sv),

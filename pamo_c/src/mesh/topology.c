@@ -19,7 +19,7 @@ int32_t pamo_shared_neighbor_count(const pamo_mesh *m,
     /* Collect unique third-vertex IDs from u's neighborhood
      * (excluding u and v themselves).  Use a small stack buffer
      * since valence is typically low. */
-    int32_t u_neighbors[256];
+    int32_t u_neighbors[1024];
     int32_t n_un = 0;
 
     for (int32_t ui = u_start; ui < u_end; ui++) {
@@ -34,7 +34,7 @@ int32_t pamo_shared_neighbor_count(const pamo_mesh *m,
             for (int32_t j = 0; j < n_un; j++) {
                 if (u_neighbors[j] == w) { found = true; break; }
             }
-            if (!found && n_un < 256) {
+            if (!found && n_un < 1024) {
                 u_neighbors[n_un++] = w;
             }
         }

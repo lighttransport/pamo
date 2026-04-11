@@ -80,11 +80,13 @@ static int prim_cmp_z(const void *a, const void *b) {
 typedef int (*cmp_fn)(const void *, const void *);
 static const cmp_fn axis_cmp[3] = { prim_cmp_x, prim_cmp_y, prim_cmp_z };
 
+#define PAMO_BVH_MAX_DEPTH 64
+
 /* Recursive build.  Returns node index in bvh->nodes. */
 static int32_t build_recursive(pamo_bvh *bvh,
                                pamo_bvh_prim *prims,
                                size_t lo, size_t hi,
-                               size_t *next_node) {
+                               size_t *next_node, int depth) {
     PAMO_ASSERT(lo < hi);
     int32_t node_idx = (int32_t)(*next_node);
     (*next_node)++;
@@ -98,8 +100,8 @@ static int32_t build_recursive(pamo_bvh *bvh,
     }
     node->box = bounds;
 
-    if (hi - lo == 1) {
-        /* Leaf. */
+    if (hi - lo == 1 || depth >= PAMO_BVH_MAX_DEPTH) {
+        /* Leaf (or depth limit reached -- store first prim). */
         node->left    = -1;
         node->right   = -1;
         node->prim_id = prims[lo].face_id;
@@ -120,8 +122,8 @@ static int32_t build_recursive(pamo_bvh *bvh,
     size_t mid = lo + n / 2;
 
     node->prim_id = -1;
-    node->left  = build_recursive(bvh, prims, lo, mid, next_node);
-    node->right = build_recursive(bvh, prims, mid, hi, next_node);
+    node->left  = build_recursive(bvh, prims, lo, mid, next_node, depth + 1);
+    node->right = build_recursive(bvh, prims, mid, hi, next_node, depth + 1);
 
     return node_idx;
 }
@@ -143,6 +145,8 @@ pamo_error pamo_bvh_build_triangles(pamo_bvh *bvh,
     }
     if (n_alive == 0) {
         bvh->n_prims = 0;
+        bvh->n_nodes = 0;
+        bvh->nodes = NULL;
         return PAMO_OK;
     }
 
@@ -176,7 +180,7 @@ pamo_error pamo_bvh_build_triangles(pamo_bvh *bvh,
     }
 
     size_t next_node = 0;
-    build_recursive(bvh, prims, 0, n_alive, &next_node);
+    build_recursive(bvh, prims, 0, n_alive, &next_node, 0);
     bvh->n_nodes = next_node;
     bvh->n_prims = n_alive;
 

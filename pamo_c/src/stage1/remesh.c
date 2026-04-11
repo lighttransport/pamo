@@ -34,6 +34,7 @@ pamo_error pamo_remesh(pamo_mesh *out, const pamo_mesh *in,
 
     int32_t R = opts->resolution;
     if (R < 4) R = 4;
+    if (R > 1024) R = 1024;
     double band = opts->band;
     if (band <= 0.0) band = 3.0 / (double)R;
 

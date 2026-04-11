@@ -139,6 +139,10 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                             const pamo_mesh *m, const pamo_bvh *bvh) {
     if (!grid_out || R < 2 || !m) return PAMO_ERR_INVALID_ARG;
 
+    /* Guard against integer overflow: R^3 * sizeof(float) must fit in size_t.
+     * R=1290 gives 1290^3*4 = ~8.6 GB. Cap at 1024 for safety. */
+    if (R > 1024) return PAMO_ERR_INVALID_ARG;
+
     size_t grid_size = (size_t)R * (size_t)R * (size_t)R;
     float vs = (float)voxel_size;
     float gox = (float)grid_origin.x, goy = (float)grid_origin.y, goz = (float)grid_origin.z;

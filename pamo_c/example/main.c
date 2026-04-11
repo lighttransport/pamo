@@ -51,8 +51,11 @@ static pamo_error load_obj(const char *path, pamo_mesh *m,
                 sscanf(line + 2, "%d/%*d %d/%*d %d/%*d",
                        &a, &b, &c) == 3 ||
                 sscanf(line + 2, "%d %d %d", &a, &b, &c) == 3) {
-                /* OBJ indices are 1-based. */
-                m->faces[fi++] = (pamo_tri){{a - 1, b - 1, c - 1}};
+                /* OBJ indices are 1-based. Validate bounds. */
+                if (a >= 1 && b >= 1 && c >= 1 &&
+                    (size_t)a <= nv && (size_t)b <= nv && (size_t)c <= nv) {
+                    m->faces[fi++] = (pamo_tri){{a - 1, b - 1, c - 1}};
+                }
             }
         }
     }

@@ -138,4 +138,15 @@ float lightrt_bvh_nearest_dist_sq(const lightrt_bvh *bvh,
     return dist_sq;
 }
 
+/* Bounded nearest distance query.  Initialize with max_dist_sq to
+ * enable early termination in the BVH traversal. */
+float lightrt_bvh_nearest_bounded(const lightrt_bvh *bvh,
+                                   const float *point,
+                                   float max_dist_sq) {
+    const auto *b = reinterpret_cast<const lightrt::TriangleBVH *>(bvh);
+    float dist_sq = max_dist_sq;
+    b->queryNearest(lightrt::Vec3(point[0], point[1], point[2]), dist_sq);
+    return dist_sq;
+}
+
 } /* extern "C" */

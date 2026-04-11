@@ -53,6 +53,12 @@ int32_t lightrt_bvh_multi_hit(const lightrt_bvh *bvh,
 float lightrt_bvh_nearest_dist_sq(const lightrt_bvh *bvh,
                                    const float *point);
 
+/* Bounded nearest distance query.  Searches only within max_dist_sq.
+ * Returns actual squared distance, or max_dist_sq if nothing closer. */
+float lightrt_bvh_nearest_bounded(const lightrt_bvh *bvh,
+                                   const float *point,
+                                   float max_dist_sq);
+
 #ifdef __cplusplus
 }
 #endif

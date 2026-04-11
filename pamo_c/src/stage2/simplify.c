@@ -521,9 +521,23 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
     }
 
     /* ── Post-process: remove T-junction non-manifold vertices ────── */
-    /* A T-junction vertex has disconnected face fans. We remove the
-     * smaller fan(s) to fix the topology. Iterate until no more
-     * T-junctions are found. */
+    /* Only run this cleanup for non-watertight input meshes.
+     * For watertight input (from Stage 1), T-junction removal creates
+     * boundary edges which is worse than keeping the T-junctions.
+     * The 2-ring locking + runtime link condition prevents most
+     * T-junctions from forming during collapse. */
+    /* Check if mesh has boundary edges. */
+    pamo_error adj_err = pamo_mesh_build_adjacency(mesh);
+    bool has_boundary = false;
+    if (adj_err == PAMO_OK && mesh->edge_face_offset) {
+        for (size_t ei = 0; ei < mesh->n_edges && !has_boundary; ei++) {
+            if (mesh->edge_face_offset[ei+1] - mesh->edge_face_offset[ei] == 1)
+                has_boundary = true;
+        }
+        pamo_mesh_free_adjacency(mesh);
+    }
+    if (!has_boundary) return PAMO_OK; /* watertight: skip cleanup */
+
     for (int cleanup = 0; cleanup < 10; cleanup++) {
         pamo_error err = pamo_mesh_build_adjacency(mesh);
         if (err != PAMO_OK) return err;

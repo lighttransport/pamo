@@ -22,6 +22,9 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef PAMO_USE_PTHREADS
+#include <pthread.h>
+#endif
 
 /* ── Ray-triangle intersection (Moeller-Trumbore) ────────────────── */
 
@@ -74,8 +77,44 @@ static int scanline_intersections(pamo_vec3d origin, const pamo_mesh *m,
     return n;
 }
 
+/* ── Parallel SDF helper ──────────────────────────────────────────── */
+
+#define GRID_IDX(ix, iy, iz, R) \
+    ((size_t)(iz) * (size_t)(R) * (size_t)(R) + \
+     (size_t)(iy) * (size_t)(R) + (size_t)(ix))
+
+#if defined(PAMO_USE_PTHREADS) && defined(PAMO_USE_LIGHTRT)
+typedef struct {
+    const void *bvh; /* lightrt_bvh* */
+    double *grid;
+    int32_t R, iz_start, iz_end;
+    pamo_vec3d grid_origin;
+    double voxel_size;
+} sdf_thread_arg;
+
+static void *sdf_phase1_worker(void *arg) {
+    sdf_thread_arg *a = (sdf_thread_arg *)arg;
+    for (int32_t iz = a->iz_start; iz < a->iz_end; iz++) {
+        for (int32_t iy = 0; iy < a->R; iy++) {
+            for (int32_t ix = 0; ix < a->R; ix++) {
+                float p[3] = {
+                    (float)(a->grid_origin.x + ((double)ix + 0.5) * a->voxel_size),
+                    (float)(a->grid_origin.y + ((double)iy + 0.5) * a->voxel_size),
+                    (float)(a->grid_origin.z + ((double)iz + 0.5) * a->voxel_size),
+                };
+                float dsq = lightrt_bvh_nearest_dist_sq(
+                    (const lightrt_bvh *)a->bvh, p);
+                a->grid[GRID_IDX(ix, iy, iz, a->R)] = sqrt((double)dsq);
+            }
+        }
+    }
+    return NULL;
+}
+#endif
+
 /* ── Main SDF computation ────────────────────────────────────────── */
 
+#undef GRID_IDX
 #define GRID_IDX(ix, iy, iz, R) \
     ((size_t)(iz) * (size_t)(R) * (size_t)(R) + \
      (size_t)(iy) * (size_t)(R) + (size_t)(ix))
@@ -89,7 +128,6 @@ pamo_error pamo_compute_sdf(double *grid, int32_t R,
 #ifdef PAMO_USE_LIGHTRT
     /* Fast path: use lightrt queryNearest (SIMD-optimized BVH). */
     {
-        /* Build lightrt BVH for nearest queries. */
         float *fverts = (float *)malloc(m->n_verts * 3 * sizeof(float));
         int32_t *ifaces = (int32_t *)malloc(m->n_faces * 3 * sizeof(int32_t));
         int32_t *vert_remap = (int32_t *)malloc(m->n_verts * sizeof(int32_t));
@@ -119,6 +157,29 @@ pamo_error pamo_compute_sdf(double *grid, int32_t R,
         free(fverts); free(ifaces);
         if (!lbvh_dist) return PAMO_ERR_ALLOC;
 
+#ifdef PAMO_USE_PTHREADS
+        /* Parallel Phase 1: split Z-slices across threads. */
+        int n_threads = 8;
+        pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
+        sdf_thread_arg *args = (sdf_thread_arg *)malloc((size_t)n_threads * sizeof(sdf_thread_arg));
+        int32_t slices_per_thread = (R + n_threads - 1) / n_threads;
+        for (int t = 0; t < n_threads; t++) {
+            args[t].bvh = lbvh_dist;
+            args[t].grid = grid;
+            args[t].R = R;
+            args[t].iz_start = t * slices_per_thread;
+            args[t].iz_end = (t + 1) * slices_per_thread;
+            if (args[t].iz_end > R) args[t].iz_end = R;
+            args[t].grid_origin = grid_origin;
+            args[t].voxel_size = voxel_size;
+            pthread_create(&threads[t], NULL, sdf_phase1_worker, &args[t]);
+        }
+        for (int t = 0; t < n_threads; t++) {
+            pthread_join(threads[t], NULL);
+        }
+        free(threads);
+        free(args);
+#else
         for (int32_t iz = 0; iz < R; iz++) {
             for (int32_t iy = 0; iy < R; iy++) {
                 for (int32_t ix = 0; ix < R; ix++) {
@@ -132,6 +193,7 @@ pamo_error pamo_compute_sdf(double *grid, int32_t R,
                 }
             }
         }
+#endif
         lightrt_bvh_destroy(lbvh_dist);
     }
 #else

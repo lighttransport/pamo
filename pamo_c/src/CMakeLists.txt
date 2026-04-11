@@ -17,7 +17,6 @@ add_library(pamo STATIC
     stage2/simplify.c
     stage3/spd_project.c
     stage3/cg_solver.c
-    stage3/line_search.c
     stage3/ccd.c
     stage3/energies/distance.c
     stage3/energies/elastic.c

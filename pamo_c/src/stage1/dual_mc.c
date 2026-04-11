@@ -32,9 +32,10 @@ typedef struct {
 
 static void emap_init(dmc_edge_map *em, size_t cap) {
     em->capacity = cap;
-    em->slots = (dmc_edge_slot *)calloc(cap, sizeof(dmc_edge_slot));
-    /* Initialize with u=-1 to mark empty. */
-    for (size_t i = 0; i < cap; i++) em->slots[i].u = -1;
+    em->slots = (dmc_edge_slot *)malloc(cap * sizeof(dmc_edge_slot));
+    if (em->slots) {
+        for (size_t i = 0; i < cap; i++) em->slots[i].u = -1;
+    }
 }
 
 static void emap_destroy(dmc_edge_map *em) {

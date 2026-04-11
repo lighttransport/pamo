@@ -15,10 +15,10 @@
  */
 #include "pamo/pamo_types.h"
 #include "pamo/pamo_mesh.h"
+#include "pamo/pamo_alloc.h"
 
 #include <math.h>
 #include <string.h>
-#include <stdlib.h>
 
 /* 2x2 matrix. */
 typedef struct { double m[2][2]; } mat2;
@@ -158,9 +158,16 @@ void pamo_elastic_hess_vec_fd(const pamo_mesh *m, pamo_vec3d *q,
                               const double *dx, double *out) {
     double eps = 1e-6;
     size_t dim = m->n_verts * 3;
-    double *grad0 = (double *)calloc(dim, sizeof(double));
-    double *grad1 = (double *)calloc(dim, sizeof(double));
-    if (!grad0 || !grad1) { free(grad0); free(grad1); return; }
+    if (dim > SIZE_MAX / sizeof(double)) return;
+
+    pamo_allocator alloc = pamo_default_allocator();
+    double *grad0 = (double *)pamo_alloc(&alloc, dim * sizeof(double));
+    double *grad1 = (double *)pamo_alloc(&alloc, dim * sizeof(double));
+    if (!grad0 || !grad1) {
+        if (grad0) pamo_free(&alloc, grad0, dim * sizeof(double));
+        if (grad1) pamo_free(&alloc, grad1, dim * sizeof(double));
+        return;
+    }
 
     pamo_elastic_gradient_fd(m, q, rest, young, poisson, grad0);
 
@@ -181,6 +188,6 @@ void pamo_elastic_hess_vec_fd(const pamo_mesh *m, pamo_vec3d *q,
     for (size_t i = 0; i < dim; i++) {
         out[i] += (grad1[i] - grad0[i]) / eps;
     }
-    free(grad0);
-    free(grad1);
+    pamo_free(&alloc, grad0, dim * sizeof(double));
+    pamo_free(&alloc, grad1, dim * sizeof(double));
 }

@@ -29,6 +29,11 @@
     ((size_t)(iz) * (size_t)(R) * (size_t)(R) + \
      (size_t)(iy) * (size_t)(R) + (size_t)(ix))
 
+/* Thresholds matching cumesh2sdf. */
+#define SDF_PRESCAN_COEFF 0.87f
+#define SDF_RAY_EPS       1e-6f
+#define SDF_MAX_R         1024
+
 /* ── Union-Find ──────────────────────────────────────────────────── */
 
 static int32_t uf_find(int32_t *parent, int32_t x) {
@@ -141,7 +146,7 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
 
     /* Guard against integer overflow: R^3 * sizeof(float) must fit in size_t.
      * R=1290 gives 1290^3*4 = ~8.6 GB. Cap at 1024 for safety. */
-    if (R > 1024) return PAMO_ERR_INVALID_ARG;
+    if (R > SDF_MAX_R) return PAMO_ERR_INVALID_ARG;
 
     size_t grid_size = (size_t)R * (size_t)R * (size_t)R;
     float vs = (float)voxel_size;
@@ -160,10 +165,9 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
 
     /* ── Phase 1: Narrow-band distance computation ───────────────── */
 #ifdef PAMO_USE_LIGHTRT
+    lightrt_bvh *lbvh = build_lightrt_from_mesh(m);
+    if (!lbvh) { free(dist); free(collide); return PAMO_ERR_ALLOC; }
     {
-        lightrt_bvh *lbvh = build_lightrt_from_mesh(m);
-        if (!lbvh) { free(dist); free(collide); return PAMO_ERR_ALLOC; }
-
         float band_sq = band * band;
 #ifdef PAMO_USE_PTHREADS
         int nt = 8;
@@ -189,8 +193,8 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                     dist[GRID_IDX(ix,iy,iz,R)] = sqrtf(lightrt_bvh_nearest_bounded(lbvh, p, band_sq));
                 }
 #endif
-        lightrt_bvh_destroy(lbvh);
     }
+    /* lbvh reused for Phase 2 below, destroyed after. */
 #else
     /* Fallback: pamo BVH. */
     for (int32_t iz = 0; iz < R; iz++)
@@ -209,8 +213,8 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
     /* ── Phase 2: Collision flags (3-axis ray tests for near-surface voxels) */
     float rayth = vs + 1e-6f;
 #ifdef PAMO_USE_LIGHTRT
+    /* Reuse lbvh from Phase 1. */
     {
-        lightrt_bvh *lbvh = build_lightrt_from_mesh(m);
         if (lbvh) {
             for (int32_t iz = 0; iz < R; iz++)
                 for (int32_t iy = 0; iy < R; iy++)
@@ -281,7 +285,7 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
 
     /* Prescan: walk X-columns, link consecutive voxels that aren't
      * near the surface (dist*N >= 0.87, matching cumesh2sdf). */
-    float prescan_thresh = 0.87f / (float)R * vs * (float)R;
+    float prescan_thresh = SDF_PRESCAN_COEFF / (float)R * vs * (float)R;
     for (int32_t iz = 0; iz < R; iz++)
         for (int32_t iy = 0; iy < R; iy++) {
             int32_t chain_start = 0; /* boundary sentinel */

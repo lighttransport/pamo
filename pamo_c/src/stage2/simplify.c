@@ -255,7 +255,6 @@ static void apply_collapse(pamo_mesh *m, int32_t u, int32_t v,
     m->verts[u] = mid;
     m->vert_alive[v] = false;
 
-    /* Process ALL faces incident to v. */
     int32_t v_start = m->vert_face_offset[v];
     int32_t v_end   = m->vert_face_offset[v + 1];
     for (int32_t fi_idx = v_start; fi_idx < v_end; fi_idx++) {

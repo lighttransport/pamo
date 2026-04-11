@@ -18,7 +18,7 @@ pamo_simplify_opts pamo_simplify_opts_default(void) {
         .target_faces            = 100,
         .min_faces               = 10,
         .max_iters               = 100,
-        .tolerance               = 4,
+        .tolerance               = 8,
         .max_undo_retries        = 5,
         .skinny_area_threshold   = 1e-6,
         .skinny_penalty_weight   = 5.0,
@@ -56,7 +56,8 @@ static const double COST_INF = 1e20;
 static bool collapse_creates_problem(const pamo_mesh *m,
                                      int32_t endpoint, int32_t other,
                                      pamo_vec3d mid,
-                                     double skinny_thresh) {
+                                     double skinny_thresh,
+                                     double flip_threshold) {
     int32_t s = m->vert_face_offset[endpoint];
     int32_t e = m->vert_face_offset[endpoint + 1];
     for (int32_t i = s; i < e; i++) {
@@ -75,7 +76,7 @@ static bool collapse_creates_problem(const pamo_mesh *m,
         double new_len = sqrt(pamo_v3_length_sq(new_n_raw));
         if (new_len < 1e-30) return true;
         pamo_vec3d new_n = pamo_v3_scale(new_n_raw, 1.0 / new_len);
-        if (pamo_v3_dot(old_n, new_n) < 0.0) return true;
+        if (pamo_v3_dot(old_n, new_n) < flip_threshold) return true;
         if (pamo_triangle_is_skinny(verts[0], verts[1], verts[2], skinny_thresh))
             return true;
     }
@@ -176,6 +177,7 @@ static bool collapse_violates_link(const pamo_mesh *m,
 static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
                                 size_t edge_idx, double scale,
                                 double skinny_weight, double skinny_thresh,
+                                double flip_threshold,
                                 const bool *vert_locked) {
     pamo_edge e = m->edges[edge_idx];
     int32_t u = e.u, v = e.v;
@@ -191,8 +193,10 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
     pamo_vec3d mid = pamo_v3_scale(pamo_v3_add(pu, pv), 0.5);
 
     /* Normal flip / skinny check for both endpoints. */
-    if (collapse_creates_problem(m, u, v, mid, skinny_thresh)) return COST_INF;
-    if (collapse_creates_problem(m, v, u, mid, skinny_thresh)) return COST_INF;
+    if (collapse_creates_problem(m, u, v, mid, skinny_thresh, flip_threshold))
+        return COST_INF;
+    if (collapse_creates_problem(m, v, u, mid, skinny_thresh, flip_threshold))
+        return COST_INF;
 
     /* Quadric error at midpoint. */
     pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
@@ -308,6 +312,7 @@ static pamo_error simplify_round(pamo_mesh *m,
                                  const pamo_simplify_opts *opts,
                                  const bool *vert_locked,
                                  double cost_limit,
+                                 bool relax_normals,
                                  size_t *n_collapsed_out) {
     pamo_allocator *alloc = &m->alloc;
     *n_collapsed_out = 0;
@@ -342,11 +347,16 @@ static pamo_error simplify_round(pamo_mesh *m,
         return PAMO_ERR_ALLOC;
     }
 
+    /* Normal flip threshold: 0 = strict (no flip allowed),
+     * negative = allow slight flips when relaxing constraints. */
+    double flip_thresh = relax_normals ? -0.5 : 0.0;
+
     size_t n_valid = 0;
     for (size_t i = 0; i < m->n_edges; i++) {
         double c = compute_edge_cost(m, Q, i, scale,
                                      opts->skinny_penalty_weight,
                                      opts->skinny_area_threshold,
+                                     flip_thresh,
                                      vert_locked);
         if (c < cost_limit) {
             costs[n_valid].cost = c;
@@ -373,10 +383,10 @@ static pamo_error simplify_round(pamo_mesh *m,
         int32_t v = m->edges[ei].v;
         if (locked[u] || locked[v]) continue;
 
-        /* Lock the 2-ring neighborhood: the endpoints, their 1-ring,
-         * and all vertices sharing a face with any 1-ring vertex.
-         * This ensures no collapse can affect the topology around
-         * this edge even with stale adjacency data. */
+        /* Lock 1-ring neighborhood of both endpoints.
+         * This prevents adjacent edges from collapsing in the same round.
+         * The runtime link-condition re-check (below) catches any
+         * remaining topology issues from stale adjacency. */
         locked[u] = true;
         locked[v] = true;
         for (int pass = 0; pass < 2; pass++) {
@@ -386,19 +396,8 @@ static pamo_error simplify_round(pamo_mesh *m,
             for (int32_t j = ep_s; j < ep_e; j++) {
                 int32_t fi = m->vert_face_list[j];
                 if (!m->face_alive[fi]) continue;
-                for (int k = 0; k < 3; k++) {
-                    int32_t w = m->faces[fi].v[k];
-                    locked[w] = true;
-                    /* Also lock w's 1-ring (2-ring of edge). */
-                    int32_t w_s = m->vert_face_offset[w];
-                    int32_t w_e = m->vert_face_offset[w + 1];
-                    for (int32_t jj = w_s; jj < w_e; jj++) {
-                        int32_t fi2 = m->vert_face_list[jj];
-                        if (!m->face_alive[fi2]) continue;
-                        for (int kk = 0; kk < 3; kk++)
-                            locked[m->faces[fi2].v[kk]] = true;
-                    }
-                }
+                for (int k = 0; k < 3; k++)
+                    locked[m->faces[fi].v[k]] = true;
             }
         }
 
@@ -500,8 +499,9 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
         if ((int32_t)alive_faces <= opts->min_faces) break;
 
         size_t n_collapsed = 0;
+        bool relax = (stuck_counter >= 2); /* relax normals when deeply stuck */
         pamo_error err = simplify_round(mesh, opts, NULL,
-                                        cost_limit, &n_collapsed);
+                                        cost_limit, relax, &n_collapsed);
         if (err != PAMO_OK) return err;
 
         err = pamo_mesh_compact(mesh);

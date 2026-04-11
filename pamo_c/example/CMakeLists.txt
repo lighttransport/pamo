@@ -3,3 +3,6 @@
 
 add_executable(pamo_example main.c)
 target_link_libraries(pamo_example PRIVATE pamo m)
+if(PAMO_USE_LIGHTRT)
+    target_link_libraries(pamo_example PRIVATE stdc++)
+endif()

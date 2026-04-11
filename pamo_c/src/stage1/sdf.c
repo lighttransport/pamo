@@ -15,6 +15,9 @@
 #include "pamo/pamo_mesh.h"
 #include "pamo/pamo_bvh.h"
 #include "pamo/pamo_alloc.h"
+#ifdef PAMO_USE_LIGHTRT
+#include "pamo/pamo_lightrt.h"
+#endif
 
 #include <math.h>
 #include <string.h>
@@ -103,44 +106,113 @@ pamo_error pamo_compute_sdf(double *grid, int32_t R,
      * the grid. Count intersections to determine inside/outside for
      * each voxel along the column. */
 
-    int max_hits = (int)m->n_faces; /* worst case */
-    if (max_hits > 10000) max_hits = 10000;
-    double *t_buf = (double *)malloc((size_t)max_hits * sizeof(double));
-    if (!t_buf) return PAMO_ERR_ALLOC;
+#ifdef PAMO_USE_LIGHTRT
+    /* Fast path: use lightrt BVH for multi-hit ray traversal. */
+    {
+        /* Convert mesh to float32 for lightrt. */
+        float *fverts = (float *)malloc(m->n_verts * 3 * sizeof(float));
+        int32_t *ifaces = (int32_t *)malloc(m->n_faces * 3 * sizeof(int32_t));
+        int32_t *vert_remap = (int32_t *)malloc(m->n_verts * sizeof(int32_t));
+        if (!fverts || !ifaces || !vert_remap) {
+            free(fverts); free(ifaces); free(vert_remap);
+            return PAMO_ERR_ALLOC;
+        }
+        int32_t alive_verts = 0, alive_faces = 0;
+        for (size_t i = 0; i < m->n_verts; i++) {
+            if (m->vert_alive[i]) {
+                fverts[alive_verts*3+0] = (float)m->verts[i].x;
+                fverts[alive_verts*3+1] = (float)m->verts[i].y;
+                fverts[alive_verts*3+2] = (float)m->verts[i].z;
+                vert_remap[i] = alive_verts++;
+            } else {
+                vert_remap[i] = -1;
+            }
+        }
+        for (size_t i = 0; i < m->n_faces; i++) {
+            if (!m->face_alive[i]) continue;
+            ifaces[alive_faces*3+0] = vert_remap[m->faces[i].v[0]];
+            ifaces[alive_faces*3+1] = vert_remap[m->faces[i].v[1]];
+            ifaces[alive_faces*3+2] = vert_remap[m->faces[i].v[2]];
+            alive_faces++;
+        }
+        free(vert_remap);
 
-    for (int32_t iy = 0; iy < R; iy++) {
-        for (int32_t ix = 0; ix < R; ix++) {
-            /* Ray origin: bottom of this column. */
-            pamo_vec3d origin = {
-                grid_origin.x + ((double)ix + 0.5) * voxel_size,
-                grid_origin.y + ((double)iy + 0.5) * voxel_size,
-                grid_origin.z - voxel_size, /* below grid */
-            };
+        lightrt_bvh *lbvh = lightrt_bvh_build(fverts, alive_verts,
+                                               ifaces, alive_faces);
+        free(fverts); free(ifaces);
+        if (!lbvh) return PAMO_ERR_ALLOC;
 
-            int n_hits = scanline_intersections(origin, m, t_buf, max_hits);
+        float grid_extent = (float)(voxel_size * (double)R);
+        float tmax = grid_extent + 2.0f * (float)voxel_size;
+        int32_t max_t = 1024;
+        float *t_hits = (float *)malloc((size_t)max_t * sizeof(float));
 
-            /* Walk the voxels in this column. A voxel at position iz
-             * is inside if there's an odd number of intersections
-             * between the ray origin and the voxel center. */
-            int hit_idx = 0;
-            bool inside = false;
-            for (int32_t iz = 0; iz < R; iz++) {
-                double voxel_z = ((double)iz + 0.5) * voxel_size + voxel_size; /* offset from origin.z */
+        for (int32_t iy = 0; iy < R; iy++) {
+            for (int32_t ix = 0; ix < R; ix++) {
+                float ox = (float)(grid_origin.x + ((double)ix + 0.5) * voxel_size);
+                float oy = (float)(grid_origin.y + ((double)iy + 0.5) * voxel_size);
+                float oz = (float)(grid_origin.z - voxel_size);
+                float origin_f[3] = {ox, oy, oz};
+                float dir_f[3] = {0.0f, 0.0f, 1.0f};
 
-                /* Count intersections up to this voxel. */
-                while (hit_idx < n_hits && t_buf[hit_idx] < voxel_z) {
-                    inside = !inside;
-                    hit_idx++;
-                }
+                int32_t n_hits = lightrt_bvh_multi_hit(lbvh, origin_f, dir_f,
+                                                       tmax, t_hits, max_t);
 
-                if (inside) {
-                    size_t idx = GRID_IDX(ix, iy, iz, R);
-                    grid[idx] = -grid[idx];
+                /* Walk voxels, flip sign at each crossing. */
+                int hit_idx = 0;
+                bool inside = false;
+                for (int32_t iz = 0; iz < R; iz++) {
+                    float voxel_z = (float)(((double)iz + 0.5) * voxel_size + voxel_size);
+                    while (hit_idx < n_hits && t_hits[hit_idx] < voxel_z) {
+                        inside = !inside;
+                        hit_idx++;
+                    }
+                    if (inside) {
+                        size_t idx = GRID_IDX(ix, iy, iz, R);
+                        grid[idx] = -grid[idx];
+                    }
                 }
             }
         }
+        free(t_hits);
+        lightrt_bvh_destroy(lbvh);
     }
+#else
+    /* Fallback: brute-force scanline O(R^2 * F). */
+    {
+        int max_hits = (int)m->n_faces;
+        if (max_hits > 10000) max_hits = 10000;
+        double *t_buf = (double *)malloc((size_t)max_hits * sizeof(double));
+        if (!t_buf) return PAMO_ERR_ALLOC;
 
-    free(t_buf);
+        for (int32_t iy = 0; iy < R; iy++) {
+            for (int32_t ix = 0; ix < R; ix++) {
+                pamo_vec3d origin = {
+                    grid_origin.x + ((double)ix + 0.5) * voxel_size,
+                    grid_origin.y + ((double)iy + 0.5) * voxel_size,
+                    grid_origin.z - voxel_size,
+                };
+
+                int n_hits = scanline_intersections(origin, m, t_buf, max_hits);
+
+                int hit_idx = 0;
+                bool inside = false;
+                for (int32_t iz = 0; iz < R; iz++) {
+                    double voxel_z = ((double)iz + 0.5) * voxel_size + voxel_size;
+                    while (hit_idx < n_hits && t_buf[hit_idx] < voxel_z) {
+                        inside = !inside;
+                        hit_idx++;
+                    }
+                    if (inside) {
+                        size_t idx = GRID_IDX(ix, iy, iz, R);
+                        grid[idx] = -grid[idx];
+                    }
+                }
+            }
+        }
+        free(t_buf);
+    }
+#endif
+
     return PAMO_OK;
 }

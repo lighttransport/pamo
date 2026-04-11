@@ -4,8 +4,12 @@
  *
  * Triangle mesh -> signed distance field on a 3D grid.
  *
- * Phase 1: Unsigned distance (BVH nearest-point, narrow-band optimized)
- * Phase 2: Sign determination (Z-axis scanline parity ray casting)
+ * Algorithm ported from cumesh2sdf (Apache 2.0):
+ *   Phase 1 (Rasterization): Compute unsigned distance for near-surface
+ *     voxels only. Far voxels get large default (1e9). Uses BVH queries
+ *     within a narrow band.
+ *   Phase 2 (Sign): 3-axis ray collision flags + union-find flood fill.
+ *     Voxels connected to grid boundary are outside (positive).
  */
 #include "pamo/pamo_mesh.h"
 #include "pamo/pamo_bvh.h"
@@ -21,56 +25,57 @@
 #include <pthread.h>
 #endif
 
-/* ── Grid indexing ───────────────────────────────────────────────── */
-
 #define GRID_IDX(ix, iy, iz, R) \
     ((size_t)(iz) * (size_t)(R) * (size_t)(R) + \
      (size_t)(iy) * (size_t)(R) + (size_t)(ix))
 
-/* ── Lightrt BVH helper ──────────────────────────────────────────── */
+/* ── Union-Find ──────────────────────────────────────────────────── */
+
+static int32_t uf_find(int32_t *parent, int32_t x) {
+    while (parent[x] != x) {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    return x;
+}
+
+static void uf_union(int32_t *parent, int32_t a, int32_t b) {
+    a = uf_find(parent, a);
+    b = uf_find(parent, b);
+    if (a != b) parent[a > b ? a : b] = (a > b ? b : a);
+}
+
+/* ── Lightrt helper ──────────────────────────────────────────────── */
 
 #ifdef PAMO_USE_LIGHTRT
-/* Build a lightrt BVH from a pamo mesh. Caller must free returned BVH
- * with lightrt_bvh_destroy(). Returns NULL on failure. */
 static lightrt_bvh *build_lightrt_from_mesh(const pamo_mesh *m) {
-    /* Overflow check. */
     if (m->n_verts > SIZE_MAX / (3 * sizeof(float)) ||
-        m->n_faces > SIZE_MAX / (3 * sizeof(int32_t))) {
+        m->n_faces > SIZE_MAX / (3 * sizeof(int32_t)))
         return NULL;
-    }
-
-    float *fverts = (float *)malloc(m->n_verts * 3 * sizeof(float));
-    int32_t *ifaces = (int32_t *)malloc(m->n_faces * 3 * sizeof(int32_t));
-    int32_t *remap = (int32_t *)malloc(m->n_verts * sizeof(int32_t));
-    if (!fverts || !ifaces || !remap) {
-        free(fverts); free(ifaces); free(remap);
-        return NULL;
-    }
-
+    float *fv = (float *)malloc(m->n_verts * 3 * sizeof(float));
+    int32_t *fi = (int32_t *)malloc(m->n_faces * 3 * sizeof(int32_t));
+    int32_t *rm = (int32_t *)malloc(m->n_verts * sizeof(int32_t));
+    if (!fv || !fi || !rm) { free(fv); free(fi); free(rm); return NULL; }
     int32_t av = 0, af = 0;
     for (size_t i = 0; i < m->n_verts; i++) {
         if (m->vert_alive[i]) {
-            fverts[av*3+0] = (float)m->verts[i].x;
-            fverts[av*3+1] = (float)m->verts[i].y;
-            fverts[av*3+2] = (float)m->verts[i].z;
-            remap[i] = av++;
-        } else {
-            remap[i] = -1;
-        }
+            fv[av*3]=   (float)m->verts[i].x;
+            fv[av*3+1]= (float)m->verts[i].y;
+            fv[av*3+2]= (float)m->verts[i].z;
+            rm[i] = av++;
+        } else rm[i] = -1;
     }
     for (size_t i = 0; i < m->n_faces; i++) {
         if (!m->face_alive[i]) continue;
-        ifaces[af*3+0] = remap[m->faces[i].v[0]];
-        ifaces[af*3+1] = remap[m->faces[i].v[1]];
-        ifaces[af*3+2] = remap[m->faces[i].v[2]];
+        fi[af*3]   = rm[m->faces[i].v[0]];
+        fi[af*3+1] = rm[m->faces[i].v[1]];
+        fi[af*3+2] = rm[m->faces[i].v[2]];
         af++;
     }
-    free(remap);
-
-    lightrt_bvh *lbvh = lightrt_bvh_build(fverts, av, ifaces, af);
-    free(fverts);
-    free(ifaces);
-    return lbvh;
+    free(rm);
+    lightrt_bvh *b = lightrt_bvh_build(fv, av, fi, af);
+    free(fv); free(fi);
+    return b;
 }
 #endif
 
@@ -79,264 +84,257 @@ static lightrt_bvh *build_lightrt_from_mesh(const pamo_mesh *m) {
 #if defined(PAMO_USE_PTHREADS) && defined(PAMO_USE_LIGHTRT)
 typedef struct {
     const void *bvh;
-    const float *coarse;
-    double *grid;
-    int32_t R, CR, iz_start, iz_end;
-    pamo_vec3d grid_origin;
-    double voxel_size;
-    float coarse_diag;
-} sdf_thread_arg;
+    float *grid;      /* float32 grid for narrow-band */
+    int32_t R, iz_start, iz_end;
+    float grid_ox, grid_oy, grid_oz;
+    float voxel_size, band;
+} sdf_worker_arg;
 
-static void *sdf_phase1_worker(void *arg) {
-    sdf_thread_arg *a = (sdf_thread_arg *)arg;
-    float band_thresh = a->coarse_diag * 2.0f;
-
-    for (int32_t iz = a->iz_start; iz < a->iz_end; iz++) {
-        int32_t cz = iz / 4;
-        if (cz >= a->CR) cz = a->CR - 1;
-        for (int32_t iy = 0; iy < a->R; iy++) {
-            int32_t cy = iy / 4;
-            if (cy >= a->CR) cy = a->CR - 1;
+static void *sdf_worker(void *arg) {
+    sdf_worker_arg *a = (sdf_worker_arg *)arg;
+    float band_sq = a->band * a->band;
+    for (int32_t iz = a->iz_start; iz < a->iz_end; iz++)
+        for (int32_t iy = 0; iy < a->R; iy++)
             for (int32_t ix = 0; ix < a->R; ix++) {
-                int32_t cx = ix / 4;
-                if (cx >= a->CR) cx = a->CR - 1;
-
-                float cd = 1e30f;
-                if (a->coarse)
-                    cd = a->coarse[(size_t)cz*a->CR*a->CR + (size_t)cy*a->CR + cx];
-
-                if (cd > band_thresh) {
-                    a->grid[GRID_IDX(ix, iy, iz, a->R)] = (double)cd;
-                } else {
-                    float p[3] = {
-                        (float)(a->grid_origin.x + ((double)ix + 0.5) * a->voxel_size),
-                        (float)(a->grid_origin.y + ((double)iy + 0.5) * a->voxel_size),
-                        (float)(a->grid_origin.z + ((double)iz + 0.5) * a->voxel_size),
-                    };
-                    float bound = (cd + a->coarse_diag);
-                    bound = bound * bound;
-                    float dsq = lightrt_bvh_nearest_bounded(
-                        (const lightrt_bvh *)a->bvh, p, bound);
-                    a->grid[GRID_IDX(ix, iy, iz, a->R)] = (double)sqrtf(dsq);
-                }
+                float p[3] = {
+                    a->grid_ox + ((float)ix + 0.5f) * a->voxel_size,
+                    a->grid_oy + ((float)iy + 0.5f) * a->voxel_size,
+                    a->grid_oz + ((float)iz + 0.5f) * a->voxel_size,
+                };
+                float dsq = lightrt_bvh_nearest_bounded(
+                    (const lightrt_bvh *)a->bvh, p, band_sq);
+                a->grid[GRID_IDX(ix, iy, iz, a->R)] = sqrtf(dsq);
             }
-        }
-    }
     return NULL;
 }
 #endif
 
-/* ── Ray-triangle intersection (for fallback scanline) ───────────── */
+/* ── Ray-triangle hit (for fallback) ─────────────────────────────── */
 
-static double ray_tri_hit(pamo_vec3d origin, pamo_vec3d dir,
-                          pamo_vec3d v0, pamo_vec3d v1, pamo_vec3d v2) {
-    pamo_vec3d e1 = pamo_v3_sub(v1, v0);
-    pamo_vec3d e2 = pamo_v3_sub(v2, v0);
-    pamo_vec3d h = pamo_v3_cross(dir, e2);
-    double a = pamo_v3_dot(e1, h);
-    if (fabs(a) < 1e-15) return -1.0;
-    double f = 1.0 / a;
-    pamo_vec3d s = pamo_v3_sub(origin, v0);
-    double u = f * pamo_v3_dot(s, h);
-    if (u < -1e-10 || u > 1.0 + 1e-10) return -1.0;
-    pamo_vec3d q = pamo_v3_cross(s, e1);
-    double v = f * pamo_v3_dot(dir, q);
-    if (v < -1e-10 || u + v > 1.0 + 1e-10) return -1.0;
-    double t = f * pamo_v3_dot(e2, q);
-    return (t > 1e-10) ? t : -1.0;
-}
-
-/* Scanline: collect sorted intersection t-values along +Z. */
-static int scanline_intersections(pamo_vec3d origin, const pamo_mesh *m,
-                                  double *t_buf, int max_t) {
-    int n = 0;
-    pamo_vec3d dir = {0.0, 0.0, 1.0};
-    for (size_t fi = 0; fi < m->n_faces; fi++) {
-        if (!m->face_alive[fi]) continue;
-        pamo_vec3d v0 = m->verts[m->faces[fi].v[0]];
-        pamo_vec3d v1 = m->verts[m->faces[fi].v[1]];
-        pamo_vec3d v2 = m->verts[m->faces[fi].v[2]];
-        double t = ray_tri_hit(origin, dir, v0, v1, v2);
-        if (t >= 0.0 && n < max_t) t_buf[n++] = t;
-    }
-    /* Insertion sort (few hits typically). */
-    for (int i = 1; i < n; i++) {
-        double key = t_buf[i];
-        int j = i - 1;
-        while (j >= 0 && t_buf[j] > key) { t_buf[j+1] = t_buf[j]; j--; }
-        t_buf[j+1] = key;
-    }
-    return n;
+static float ray_tri_hitf(float ox, float oy, float oz,
+                          float dx, float dy, float dz,
+                          float v0x, float v0y, float v0z,
+                          float v1x, float v1y, float v1z,
+                          float v2x, float v2y, float v2z) {
+    float e1x=v1x-v0x, e1y=v1y-v0y, e1z=v1z-v0z;
+    float e2x=v2x-v0x, e2y=v2y-v0y, e2z=v2z-v0z;
+    float hx=dy*e2z-dz*e2y, hy=dz*e2x-dx*e2z, hz=dx*e2y-dy*e2x;
+    float a = e1x*hx + e1y*hy + e1z*hz;
+    if (fabsf(a) < 1e-12f) return -1.0f;
+    float f = 1.0f/a;
+    float sx=ox-v0x, sy=oy-v0y, sz=oz-v0z;
+    float u = f*(sx*hx+sy*hy+sz*hz);
+    if (u < -1e-6f || u > 1.0f+1e-6f) return -1.0f;
+    float qx=sy*e1z-sz*e1y, qy=sz*e1x-sx*e1z, qz=sx*e1y-sy*e1x;
+    float v = f*(dx*qx+dy*qy+dz*qz);
+    if (v < -1e-6f || u+v > 1.0f+1e-6f) return -1.0f;
+    float t = f*(e2x*qx+e2y*qy+e2z*qz);
+    return t > 1e-6f ? t : -1.0f;
 }
 
 /* ── Main SDF computation ────────────────────────────────────────── */
 
-pamo_error pamo_compute_sdf(double *grid, int32_t R,
+pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                             pamo_vec3d grid_origin, double voxel_size,
                             const pamo_mesh *m, const pamo_bvh *bvh) {
-    if (!grid || R < 2 || !m) return PAMO_ERR_INVALID_ARG;
+    if (!grid_out || R < 2 || !m) return PAMO_ERR_INVALID_ARG;
 
-    /* ── Phase 1: Unsigned distances ─────────────────────────────── */
+    size_t grid_size = (size_t)R * (size_t)R * (size_t)R;
+    float vs = (float)voxel_size;
+    float gox = (float)grid_origin.x, goy = (float)grid_origin.y, goz = (float)grid_origin.z;
+
+    /* Band: 0.87/N + 3/N (matching cumesh2sdf threshold). */
+    float band = (0.87f + 3.0f) / (float)R * vs * (float)R;
+
+    /* Allocate float32 working grid (distance + collision flags). */
+    float *dist = (float *)malloc(grid_size * sizeof(float));
+    uint8_t *collide = (uint8_t *)calloc(grid_size, 3); /* 3 flags per voxel */
+    if (!dist || !collide) { free(dist); free(collide); return PAMO_ERR_ALLOC; }
+
+    /* Initialize distance to large value. */
+    for (size_t i = 0; i < grid_size; i++) dist[i] = 1e9f;
+
+    /* ── Phase 1: Narrow-band distance computation ───────────────── */
 #ifdef PAMO_USE_LIGHTRT
     {
         lightrt_bvh *lbvh = build_lightrt_from_mesh(m);
-        if (!lbvh) return PAMO_ERR_ALLOC;
+        if (!lbvh) { free(dist); free(collide); return PAMO_ERR_ALLOC; }
 
-        /* Coarse grid for narrow-band optimization. */
-        int32_t CR = R / 4;
-        if (CR < 2) CR = 2;
-        double cvoxel = voxel_size * 4.0;
-        float coarse_diag = (float)(cvoxel * 1.733);
-        size_t csize = (size_t)CR * (size_t)CR * (size_t)CR;
-        float *coarse = (float *)malloc(csize * sizeof(float));
-        if (coarse) {
-            for (int32_t cz = 0; cz < CR; cz++)
-                for (int32_t cy = 0; cy < CR; cy++)
-                    for (int32_t cx = 0; cx < CR; cx++) {
-                        float p[3] = {
-                            (float)(grid_origin.x + ((double)cx + 0.5) * cvoxel),
-                            (float)(grid_origin.y + ((double)cy + 0.5) * cvoxel),
-                            (float)(grid_origin.z + ((double)cz + 0.5) * cvoxel),
-                        };
-                        coarse[(size_t)cz*CR*CR + (size_t)cy*CR + cx] =
-                            sqrtf(lightrt_bvh_nearest_dist_sq(lbvh, p));
-                    }
-        }
-
+        float band_sq = band * band;
 #ifdef PAMO_USE_PTHREADS
-        int n_threads = 8;
-        pthread_t *threads = (pthread_t *)malloc((size_t)n_threads * sizeof(pthread_t));
-        sdf_thread_arg *args = (sdf_thread_arg *)malloc((size_t)n_threads * sizeof(sdf_thread_arg));
-        if (threads && args) {
-            int32_t per = (R + n_threads - 1) / n_threads;
-            for (int t = 0; t < n_threads; t++) {
-                args[t] = (sdf_thread_arg){
-                    .bvh = lbvh, .coarse = coarse, .grid = grid,
-                    .R = R, .CR = CR,
-                    .iz_start = t * per,
-                    .iz_end = (t+1)*per > R ? R : (t+1)*per,
-                    .grid_origin = grid_origin,
-                    .voxel_size = voxel_size,
-                    .coarse_diag = coarse_diag,
-                };
-                pthread_create(&threads[t], NULL, sdf_phase1_worker, &args[t]);
-            }
-            for (int t = 0; t < n_threads; t++)
-                pthread_join(threads[t], NULL);
+        int nt = 8;
+        pthread_t *thr = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
+        sdf_worker_arg *args = (sdf_worker_arg *)malloc((size_t)nt * sizeof(sdf_worker_arg));
+        int32_t per = (R + nt - 1) / nt;
+        for (int t = 0; t < nt; t++) {
+            args[t] = (sdf_worker_arg){
+                .bvh = lbvh, .grid = dist, .R = R,
+                .iz_start = t*per, .iz_end = (t+1)*per > R ? R : (t+1)*per,
+                .grid_ox = gox, .grid_oy = goy, .grid_oz = goz,
+                .voxel_size = vs, .band = band,
+            };
+            pthread_create(&thr[t], NULL, sdf_worker, &args[t]);
         }
-        free(threads);
-        free(args);
+        for (int t = 0; t < nt; t++) pthread_join(thr[t], NULL);
+        free(thr); free(args);
 #else
-        float band_thresh = coarse_diag * 2.0f;
-        for (int32_t iz = 0; iz < R; iz++) {
-            int32_t cz = iz/4; if (cz >= CR) cz = CR-1;
-            for (int32_t iy = 0; iy < R; iy++) {
-                int32_t cy = iy/4; if (cy >= CR) cy = CR-1;
+        for (int32_t iz = 0; iz < R; iz++)
+            for (int32_t iy = 0; iy < R; iy++)
                 for (int32_t ix = 0; ix < R; ix++) {
-                    int32_t cx = ix/4; if (cx >= CR) cx = CR-1;
-                    float cd = coarse ? coarse[(size_t)cz*CR*CR + (size_t)cy*CR + cx] : 1e30f;
-                    if (cd > band_thresh) {
-                        grid[GRID_IDX(ix, iy, iz, R)] = (double)cd;
-                    } else {
-                        float p[3] = {
-                            (float)(grid_origin.x + ((double)ix+0.5)*voxel_size),
-                            (float)(grid_origin.y + ((double)iy+0.5)*voxel_size),
-                            (float)(grid_origin.z + ((double)iz+0.5)*voxel_size),
-                        };
-                        float bound = (cd + coarse_diag) * (cd + coarse_diag);
-                        grid[GRID_IDX(ix, iy, iz, R)] =
-                            (double)sqrtf(lightrt_bvh_nearest_bounded(lbvh, p, bound));
-                    }
+                    float p[3] = {gox+((float)ix+0.5f)*vs, goy+((float)iy+0.5f)*vs, goz+((float)iz+0.5f)*vs};
+                    dist[GRID_IDX(ix,iy,iz,R)] = sqrtf(lightrt_bvh_nearest_bounded(lbvh, p, band_sq));
                 }
-            }
-        }
 #endif
-        free(coarse);
         lightrt_bvh_destroy(lbvh);
     }
 #else
-    /* Fallback: pamo BVH nearest-point queries. */
+    /* Fallback: pamo BVH. */
     for (int32_t iz = 0; iz < R; iz++)
         for (int32_t iy = 0; iy < R; iy++)
             for (int32_t ix = 0; ix < R; ix++) {
-                pamo_vec3d p = {
-                    grid_origin.x + ((double)ix + 0.5) * voxel_size,
-                    grid_origin.y + ((double)iy + 0.5) * voxel_size,
-                    grid_origin.z + ((double)iz + 0.5) * voxel_size,
-                };
+                pamo_vec3d p = {grid_origin.x+((double)ix+0.5)*voxel_size,
+                                grid_origin.y+((double)iy+0.5)*voxel_size,
+                                grid_origin.z+((double)iz+0.5)*voxel_size};
                 pamo_nearest_result res;
                 pamo_bvh_nearest(bvh, m, p, &res);
-                grid[GRID_IDX(ix, iy, iz, R)] = sqrt(res.dist_sq);
+                float d = (float)sqrt(res.dist_sq);
+                if (d < band) dist[GRID_IDX(ix,iy,iz,R)] = d;
             }
 #endif
 
-    /* ── Phase 2: Sign via Z-scanline parity ─────────────────────── */
+    /* ── Phase 2: Collision flags (3-axis ray tests for near-surface voxels) */
+    float rayth = vs + 1e-6f;
 #ifdef PAMO_USE_LIGHTRT
     {
         lightrt_bvh *lbvh = build_lightrt_from_mesh(m);
-        if (!lbvh) return PAMO_ERR_ALLOC;
-
-        float tmax = (float)(voxel_size * (double)R) + 2.0f * (float)voxel_size;
-        int32_t max_t = 1024;
-        float *t_hits = (float *)malloc((size_t)max_t * sizeof(float));
-        if (!t_hits) { lightrt_bvh_destroy(lbvh); return PAMO_ERR_ALLOC; }
-
-        for (int32_t iy = 0; iy < R; iy++) {
-            for (int32_t ix = 0; ix < R; ix++) {
-                float o[3] = {
-                    (float)(grid_origin.x + ((double)ix + 0.5) * voxel_size),
-                    (float)(grid_origin.y + ((double)iy + 0.5) * voxel_size),
-                    (float)(grid_origin.z - voxel_size),
-                };
-                float dir[3] = {0.0f, 0.0f, 1.0f};
-                int32_t n = lightrt_bvh_multi_hit(lbvh, o, dir, tmax,
-                                                   t_hits, max_t);
-                int hit_idx = 0;
-                bool inside = false;
-                for (int32_t iz = 0; iz < R; iz++) {
-                    float vz = (float)(((double)iz + 0.5) * voxel_size + voxel_size);
-                    while (hit_idx < n && t_hits[hit_idx] < vz) {
-                        inside = !inside;
-                        hit_idx++;
+        if (lbvh) {
+            for (int32_t iz = 0; iz < R; iz++)
+                for (int32_t iy = 0; iy < R; iy++)
+                    for (int32_t ix = 0; ix < R; ix++) {
+                        size_t idx = GRID_IDX(ix, iy, iz, R);
+                        if (dist[idx] > rayth) continue;
+                        float px = gox + ((float)ix + 0.5f) * vs;
+                        float py = goy + ((float)iy + 0.5f) * vs;
+                        float pz = goz + ((float)iz + 0.5f) * vs;
+                        float o[3], d[3];
+                        /* +X */
+                        o[0]=px; o[1]=py; o[2]=pz; d[0]=1; d[1]=0; d[2]=0;
+                        if (lightrt_bvh_any_hit(lbvh, o, d, rayth)) collide[idx*3] = 1;
+                        /* +Y */
+                        d[0]=0; d[1]=1; d[2]=0;
+                        if (lightrt_bvh_any_hit(lbvh, o, d, rayth)) collide[idx*3+1] = 1;
+                        /* +Z */
+                        d[0]=0; d[1]=0; d[2]=1;
+                        if (lightrt_bvh_any_hit(lbvh, o, d, rayth)) collide[idx*3+2] = 1;
                     }
-                    if (inside) grid[GRID_IDX(ix, iy, iz, R)] = -grid[GRID_IDX(ix, iy, iz, R)];
-                }
-            }
+            lightrt_bvh_destroy(lbvh);
         }
-        free(t_hits);
-        lightrt_bvh_destroy(lbvh);
     }
 #else
-    /* Fallback: brute-force scanline. */
-    {
-        int max_hits = (int)m->n_faces;
-        if (max_hits > 10000) max_hits = 10000;
-        double *t_buf = (double *)malloc((size_t)max_hits * sizeof(double));
-        if (!t_buf) return PAMO_ERR_ALLOC;
-
-        for (int32_t iy = 0; iy < R; iy++) {
+    /* Fallback: brute-force ray-face test. */
+    for (int32_t iz = 0; iz < R; iz++)
+        for (int32_t iy = 0; iy < R; iy++)
             for (int32_t ix = 0; ix < R; ix++) {
-                pamo_vec3d origin = {
-                    grid_origin.x + ((double)ix + 0.5) * voxel_size,
-                    grid_origin.y + ((double)iy + 0.5) * voxel_size,
-                    grid_origin.z - voxel_size,
-                };
-                int n = scanline_intersections(origin, m, t_buf, max_hits);
-                int hit_idx = 0;
-                bool inside = false;
-                for (int32_t iz = 0; iz < R; iz++) {
-                    double vz = ((double)iz + 0.5) * voxel_size + voxel_size;
-                    while (hit_idx < n && t_buf[hit_idx] < vz) {
-                        inside = !inside;
-                        hit_idx++;
+                size_t idx = GRID_IDX(ix, iy, iz, R);
+                if (dist[idx] > rayth) continue;
+                float px = gox + ((float)ix + 0.5f) * vs;
+                float py = goy + ((float)iy + 0.5f) * vs;
+                float pz = goz + ((float)iz + 0.5f) * vs;
+                for (size_t fi = 0; fi < m->n_faces; fi++) {
+                    if (!m->face_alive[fi]) continue;
+                    float v0x=(float)m->verts[m->faces[fi].v[0]].x;
+                    float v0y=(float)m->verts[m->faces[fi].v[0]].y;
+                    float v0z=(float)m->verts[m->faces[fi].v[0]].z;
+                    float v1x=(float)m->verts[m->faces[fi].v[1]].x;
+                    float v1y=(float)m->verts[m->faces[fi].v[1]].y;
+                    float v1z=(float)m->verts[m->faces[fi].v[1]].z;
+                    float v2x=(float)m->verts[m->faces[fi].v[2]].x;
+                    float v2y=(float)m->verts[m->faces[fi].v[2]].y;
+                    float v2z=(float)m->verts[m->faces[fi].v[2]].z;
+                    float t;
+                    if (!(collide[idx*3])) {
+                        t = ray_tri_hitf(px,py,pz, 1,0,0, v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z);
+                        if (t >= 0.0f && t <= rayth) collide[idx*3] = 1;
                     }
-                    if (inside) grid[GRID_IDX(ix, iy, iz, R)] = -grid[GRID_IDX(ix, iy, iz, R)];
+                    if (!(collide[idx*3+1])) {
+                        t = ray_tri_hitf(px,py,pz, 0,1,0, v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z);
+                        if (t >= 0.0f && t <= rayth) collide[idx*3+1] = 1;
+                    }
+                    if (!(collide[idx*3+2])) {
+                        t = ray_tri_hitf(px,py,pz, 0,0,1, v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z);
+                        if (t >= 0.0f && t <= rayth) collide[idx*3+2] = 1;
+                    }
+                }
+            }
+#endif
+
+    /* ── Phase 3: Union-Find sign determination ──────────────────── */
+    /* Node 0 = boundary sentinel. Nodes 1..N^3 = voxels. */
+    size_t uf_size = grid_size + 1;
+    int32_t *parent = (int32_t *)malloc(uf_size * sizeof(int32_t));
+    if (!parent) { free(dist); free(collide); return PAMO_ERR_ALLOC; }
+    for (size_t i = 0; i < uf_size; i++) parent[i] = (int32_t)i;
+
+    /* Prescan: walk X-columns, link consecutive voxels that aren't
+     * near the surface (dist*N >= 0.87, matching cumesh2sdf). */
+    float prescan_thresh = 0.87f / (float)R * vs * (float)R;
+    for (int32_t iz = 0; iz < R; iz++)
+        for (int32_t iy = 0; iy < R; iy++) {
+            int32_t chain_start = 0; /* boundary sentinel */
+            for (int32_t ix = 0; ix < R; ix++) {
+                size_t idx = GRID_IDX(ix, iy, iz, R);
+                int32_t node = (int32_t)(idx + 1);
+                if (dist[idx] < prescan_thresh) {
+                    /* Near surface: start new chain. */
+                    chain_start = node;
+                } else {
+                    /* Far from surface: link to current chain. */
+                    parent[node] = chain_start;
                 }
             }
         }
-        free(t_buf);
-    }
-#endif
 
+    /* 3D union: link +X/+Y/+Z neighbors if no collision flag separates them. */
+    for (int32_t iz = 0; iz < R; iz++)
+        for (int32_t iy = 0; iy < R; iy++)
+            for (int32_t ix = 0; ix < R; ix++) {
+                size_t idx = GRID_IDX(ix, iy, iz, R);
+                int32_t node = (int32_t)(idx + 1);
+
+                /* Connect boundary voxels to sentinel (node 0). */
+                if (ix == 0 || ix == R-1 || iy == 0 || iy == R-1 ||
+                    iz == 0 || iz == R-1) {
+                    if (dist[idx] >= prescan_thresh)
+                        uf_union(parent, node, 0);
+                }
+
+                /* +X neighbor. */
+                if (ix < R-1 && !collide[idx*3]) {
+                    int32_t nb = (int32_t)(GRID_IDX(ix+1, iy, iz, R) + 1);
+                    uf_union(parent, node, nb);
+                }
+                /* +Y neighbor. */
+                if (iy < R-1 && !collide[idx*3+1]) {
+                    int32_t nb = (int32_t)(GRID_IDX(ix, iy+1, iz, R) + 1);
+                    uf_union(parent, node, nb);
+                }
+                /* +Z neighbor. */
+                if (iz < R-1 && !collide[idx*3+2]) {
+                    int32_t nb = (int32_t)(GRID_IDX(ix, iy, iz+1, R) + 1);
+                    uf_union(parent, node, nb);
+                }
+            }
+
+    /* Apply sign: voxels not connected to boundary sentinel are inside. */
+    int32_t boundary_root = uf_find(parent, 0);
+    for (size_t i = 0; i < grid_size; i++) {
+        int32_t root = uf_find(parent, (int32_t)(i + 1));
+        float d = dist[i];
+        grid_out[i] = (root != boundary_root) ? -(double)d : (double)d;
+    }
+
+    free(parent);
+    free(collide);
+    free(dist);
     return PAMO_OK;
 }

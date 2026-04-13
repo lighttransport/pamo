@@ -211,6 +211,29 @@ pamo_error pamo_dual_mc(pamo_mesh *out, const double *sdf, int32_t R,
 
     size_t fi = 0;
 
+    /* Emit quads around each grid edge that crosses the iso-surface.
+     *
+     * The cells surrounding a grid edge are traversed in the order
+     * (-,-), (+,-), (+,+), (-,+) in the 2D plane perpendicular to the
+     * edge. For an X-edge that maps to the YZ plane, and using
+     * (c1-c0) × (c2-c0) as the triangle normal convention, the
+     * non-flipped triangulation (c0,c1,c2) + (c0,c2,c3) has a normal
+     * of +X. For a Y-edge in the XZ plane the non-flipped normal is
+     * -Y, and for a Z-edge in the XY plane it is +Z.
+     *
+     * The outward surface normal points from negative SDF (inside) to
+     * positive SDF (outside), i.e. in the direction where v increases.
+     * So the per-axis flip conditions are:
+     *   X: flip when surface normal points -X → when v0 > v1
+     *   Y: flip when surface normal points +Y → when v0 < v1
+     *      (because the non-flipped quad already faces -Y)
+     *   Z: flip when surface normal points -Z → when v0 > v1
+     *
+     * Getting this wrong on any axis leaves neighbouring quads with
+     * inconsistent winding — the mesh is still closed but trimesh
+     * reports is_winding_consistent = False.
+     */
+
     /* X-edges */
     for (int32_t iz = 0; iz < R; iz++)
         for (int32_t iy = 0; iy < R; iy++)
@@ -229,10 +252,10 @@ pamo_error pamo_dual_mc(pamo_mesh *out, const double *sdf, int32_t R,
                 }
                 if (nc == 4) {
                     fi = emit_quad(out->faces, fi, max_faces,
-                                   c[0], c[1], c[2], c[3], v0 < v1, &em);
+                                   c[0], c[1], c[2], c[3], v0 > v1, &em);
                 } else if (nc == 3 && fi < max_faces) {
                     int32_t a = c[0], b = c[1], cc = c[2];
-                    if (v0 < v1) { int32_t t = b; b = cc; cc = t; }
+                    if (v0 > v1) { int32_t t = b; b = cc; cc = t; }
                     if (tri_can_add(&em, a, b, cc)) {
                         out->faces[fi++] = (pamo_tri){{a, b, cc}};
                         tri_record(&em, a, b, cc);
@@ -287,10 +310,10 @@ pamo_error pamo_dual_mc(pamo_mesh *out, const double *sdf, int32_t R,
                 }
                 if (nc == 4) {
                     fi = emit_quad(out->faces, fi, max_faces,
-                                   c[0], c[1], c[2], c[3], v0 < v1, &em);
+                                   c[0], c[1], c[2], c[3], v0 > v1, &em);
                 } else if (nc == 3 && fi < max_faces) {
                     int32_t a = c[0], b = c[1], cc = c[2];
-                    if (v0 < v1) { int32_t t = b; b = cc; cc = t; }
+                    if (v0 > v1) { int32_t t = b; b = cc; cc = t; }
                     if (tri_can_add(&em, a, b, cc)) {
                         out->faces[fi++] = (pamo_tri){{a, b, cc}};
                         tri_record(&em, a, b, cc);

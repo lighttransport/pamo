@@ -8,7 +8,6 @@
 #include "pamo/pamo_alloc.h"
 
 #include <string.h>
-#include <stdlib.h>
 
 #define SDF_IDX(ix, iy, iz, R) \
     ((size_t)(iz) * (size_t)(R) * (size_t)(R) + \
@@ -28,19 +27,29 @@ typedef struct {
 typedef struct {
     dmc_edge_slot *slots;
     size_t capacity;
+    const pamo_allocator *alloc;  /* used for free in emap_destroy */
 } dmc_edge_map;
 
-static void emap_init(dmc_edge_map *em, size_t cap) {
+static void emap_init(dmc_edge_map *em, size_t cap,
+                      const pamo_allocator *alloc) {
     em->capacity = cap;
-    em->slots = (dmc_edge_slot *)malloc(cap * sizeof(dmc_edge_slot));
+    em->alloc = alloc;
+    /* Route through the mesh allocator so tracking allocators (leak
+     * detection, budget tracking) see this buffer. */
+    em->slots = (dmc_edge_slot *)pamo_alloc(
+        alloc, cap * sizeof(dmc_edge_slot));
     if (em->slots) {
         for (size_t i = 0; i < cap; i++) em->slots[i].u = -1;
     }
 }
 
 static void emap_destroy(dmc_edge_map *em) {
-    free(em->slots);
+    if (em->slots && em->alloc) {
+        pamo_free(em->alloc, em->slots,
+                  em->capacity * sizeof(dmc_edge_slot));
+    }
     em->slots = NULL;
+    em->capacity = 0;
 }
 
 static size_t emap_hash(int32_t u, int32_t v, size_t cap) {
@@ -205,9 +214,14 @@ pamo_error pamo_dual_mc(pamo_mesh *out, const double *sdf, int32_t R,
                 };
             }
 
-    /* Edge map to track usage. Size ~4x expected edges for low collision. */
+    /* Edge map to track usage. Size ~4× expected edges for low collision. */
     dmc_edge_map em;
-    emap_init(&em, n_surf * 8);
+    emap_init(&em, n_surf * 8, alloc);
+    if (!em.slots) {
+        pamo_free(alloc, cell_vert, n_cells * sizeof(int32_t));
+        pamo_mesh_destroy(out);
+        return PAMO_ERR_ALLOC;
+    }
 
     size_t fi = 0;
 

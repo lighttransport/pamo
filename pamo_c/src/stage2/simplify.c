@@ -27,6 +27,14 @@ pamo_simplify_opts pamo_simplify_opts_default(void) {
     };
 }
 
+/* Upper bound on 1-ring valence we handle on the stack. Real meshes
+ * almost never have vertices with more than ~30 incident triangles; we
+ * allow 8× that to stay safe with only 2 KiB of stack per call. When a
+ * vertex exceeds this we take the conservative path — report the
+ * collapse as unsafe or skip the cleanup pass for that vertex — instead
+ * of silently truncating the neighbour list. */
+#define PAMO_MAX_VALENCE 256
+
 /* ── Per-vertex quadric computation ──────────────────────────────── */
 
 static void compute_quadrics(const pamo_mesh *m, pamo_quadric *Q) {
@@ -111,7 +119,7 @@ static int32_t count_shared_faces(const pamo_mesh *m, int32_t u, int32_t v) {
 static bool collapse_violates_link(const pamo_mesh *m,
                                    int32_t u, int32_t v) {
     /* Collect vertices adjacent to u (excluding v). */
-    int32_t u_adj[256], n_u = 0;
+    int32_t u_adj[PAMO_MAX_VALENCE], n_u = 0;
     int32_t u_s = m->vert_face_offset[u];
     int32_t u_e = m->vert_face_offset[u + 1];
     for (int32_t i = u_s; i < u_e; i++) {
@@ -125,12 +133,18 @@ static bool collapse_violates_link(const pamo_mesh *m,
             for (int32_t j = 0; j < n_u; j++) {
                 if (u_adj[j] == w) { dup = true; break; }
             }
-            if (!dup && n_u < 256) u_adj[n_u++] = w;
+            if (dup) continue;
+            /* Overflow: conservatively report as unsafe rather than
+             * silently drop neighbours, which could cause us to accept
+             * a collapse that would actually create a non-manifold
+             * vertex. */
+            if (n_u >= PAMO_MAX_VALENCE) return true;
+            u_adj[n_u++] = w;
         }
     }
 
     /* Collect vertices adjacent to v (excluding u). */
-    int32_t v_adj[256], n_v = 0;
+    int32_t v_adj[PAMO_MAX_VALENCE], n_v = 0;
     int32_t v_s = m->vert_face_offset[v];
     int32_t v_e = m->vert_face_offset[v + 1];
     for (int32_t i = v_s; i < v_e; i++) {
@@ -144,7 +158,9 @@ static bool collapse_violates_link(const pamo_mesh *m,
             for (int32_t j = 0; j < n_v; j++) {
                 if (v_adj[j] == w) { dup = true; break; }
             }
-            if (!dup && n_v < 256) v_adj[n_v++] = w;
+            if (dup) continue;
+            if (n_v >= PAMO_MAX_VALENCE) return true;
+            v_adj[n_v++] = w;
         }
     }
 
@@ -430,8 +446,9 @@ static pamo_error simplify_round(pamo_mesh *m,
         if (shared == 0) continue;  /* disconnected: skip */
 
         /* Count shared vertex neighbors. */
-        int32_t u_nb[256], n_un = 0;
-        for (int32_t j = u_s2; j < u_e2; j++) {
+        int32_t u_nb[PAMO_MAX_VALENCE], n_un = 0;
+        bool nb_overflow = false;
+        for (int32_t j = u_s2; j < u_e2 && !nb_overflow; j++) {
             int32_t fi = m->vert_face_list[j];
             if (!m->face_alive[fi]) continue;
             const int32_t *fv = m->faces[fi].v;
@@ -441,9 +458,14 @@ static pamo_error simplify_round(pamo_mesh *m,
                 bool dup = false;
                 for (int32_t d = 0; d < n_un; d++)
                     if (u_nb[d] == w) { dup = true; break; }
-                if (!dup && n_un < 256) u_nb[n_un++] = w;
+                if (dup) continue;
+                if (n_un >= PAMO_MAX_VALENCE) { nb_overflow = true; break; }
+                u_nb[n_un++] = w;
             }
         }
+        /* Valence exceeded stack buffer — skip this collapse rather
+         * than silently truncating the neighbour set. */
+        if (nb_overflow) continue;
         int32_t v_s2 = m->vert_face_offset[v];
         int32_t v_e2 = m->vert_face_offset[v + 1];
         int32_t n_shared_nb = 0;
@@ -547,18 +569,24 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
             int32_t s = mesh->vert_face_offset[vi];
             int32_t e = mesh->vert_face_offset[vi + 1];
             int32_t n_inc = 0;
-            int32_t inc_faces[256];
+            int32_t inc_faces[PAMO_MAX_VALENCE];
+            bool inc_overflow = false;
             for (int32_t j = s; j < e; j++) {
                 int32_t fi = mesh->vert_face_list[j];
                 if (!mesh->face_alive[fi]) continue;
-                if (n_inc < 256) inc_faces[n_inc++] = fi;
+                if (n_inc >= PAMO_MAX_VALENCE) { inc_overflow = true; break; }
+                inc_faces[n_inc++] = fi;
             }
+            /* Skip extreme-valence vertices rather than truncating their
+             * incident-face list, which would misreport the component
+             * count and could delete real geometry. */
+            if (inc_overflow) continue;
             if (n_inc <= 1) continue;
 
             /* BFS over face adjacency around this vertex. */
-            bool visited[256] = {false};
+            bool visited[PAMO_MAX_VALENCE] = {false};
             visited[0] = true;
-            int32_t queue[256];
+            int32_t queue[PAMO_MAX_VALENCE];
             queue[0] = 0;
             int32_t qhead = 0, qtail = 1;
             while (qhead < qtail) {

@@ -29,19 +29,15 @@ extern "C" {
 #include "pamo/pamo.h"
 }
 
+#include "embind-utils.hpp"
+
 using namespace emscripten;
+using embind_utils::float64ArrayFromVector;
+using embind_utils::int32ArrayFromVector;
+using embind_utils::pick;
+using embind_utils::readTypedArray;
 
 namespace {
-
-template <typename T>
-static std::vector<T> readTypedArray(const val &arr) {
-    if (arr.isUndefined() || arr.isNull()) return {};
-    const size_t n = arr["length"].as<size_t>();
-    std::vector<T> out(n);
-    val dst = val(typed_memory_view(n, out.data()));
-    dst.call<void>("set", arr);
-    return out;
-}
 
 // Build a pamo_mesh from flat typed arrays.  Returns an initialized
 // mesh (caller must call pamo_mesh_destroy).
@@ -99,22 +95,9 @@ static val meshToJS(const pamo_mesh *m) {
         idx.push_back(c);
     }
 
-    val Float64Array = val::global("Float64Array");
-    val Int32Array = val::global("Int32Array");
-    val v_out = Float64Array.new_(verts.size());
-    if (!verts.empty()) {
-        v_out.call<void>("set",
-            val(typed_memory_view(verts.size(), verts.data())));
-    }
-    val i_out = Int32Array.new_(idx.size());
-    if (!idx.empty()) {
-        i_out.call<void>("set",
-            val(typed_memory_view(idx.size(), idx.data())));
-    }
-
     val obj = val::object();
-    obj.set("vertices", v_out);
-    obj.set("indices", i_out);
+    obj.set("vertices", float64ArrayFromVector(verts));
+    obj.set("indices", int32ArrayFromVector(idx));
     return obj;
 }
 
@@ -125,19 +108,10 @@ static val resultOk(val mesh_obj) {
 
 static val resultErr(pamo_error e) {
     val obj = val::object();
-    val F64 = val::global("Float64Array");
-    val I32 = val::global("Int32Array");
-    obj.set("vertices", F64.new_(0));
-    obj.set("indices", I32.new_(0));
+    obj.set("vertices", float64ArrayFromVector({}));
+    obj.set("indices", int32ArrayFromVector({}));
     obj.set("error", std::string(pamo_error_string(e)));
     return obj;
-}
-
-template <typename T>
-static void pick(const val &js, const char *k, T &dst) {
-    if (js.isUndefined() || js.isNull()) return;
-    val v = js[k];
-    if (!v.isUndefined() && !v.isNull()) dst = v.as<T>();
 }
 
 // ── Stage 1: remesh ────────────────────────────────────────────────

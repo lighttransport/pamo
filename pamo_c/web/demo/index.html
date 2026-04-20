@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>pamo_c WASM demo</title>
+</head>
+<body>
+<h1>pamo_c WASM demo</h1>
+<p>Runs stage 1 (remesh) on a unit tetrahedron. Open the devtools console.</p>
+<pre id="log"></pre>
+<script type="module">
+import { loadPamo } from '../js/PamoLoader.js';
+
+const logEl = document.getElementById('log');
+function log(...args) {
+    console.log(...args);
+    logEl.textContent += args.map(a =>
+        typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ') + '\n';
+}
+
+// Simple tetrahedron.
+const vertices = new Float64Array([
+    0,0,0,  1,0,0,  0,1,0,  0,0,1,
+]);
+const indices = new Int32Array([
+    0,2,1, 0,1,3, 0,3,2, 1,2,3,
+]);
+
+(async () => {
+    try {
+        const pamo = await loadPamo();
+        const r = pamo.remesh(vertices, indices, { resolution: 32 });
+        log('remesh error:', r.error);
+        log('  verts:', r.vertices.length / 3, 'tris:', r.indices.length / 3);
+
+        if (r.vertices.length > 9) {
+            const s = pamo.simplify(r.vertices, r.indices, {
+                target_faces: Math.max(10, Math.floor(r.indices.length / 6)),
+            });
+            log('simplify error:', s.error);
+            log('  verts:', s.vertices.length / 3, 'tris:', s.indices.length / 3);
+        }
+    } catch (e) {
+        log('ERROR', e.message || e);
+    }
+})();
+</script>
+</body>
+</html>

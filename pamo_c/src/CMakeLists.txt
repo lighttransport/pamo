@@ -26,7 +26,7 @@ add_library(pamo STATIC
 )
 
 target_include_directories(pamo PUBLIC
-    ${CMAKE_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/include
 )
 
 target_link_libraries(pamo PRIVATE m)

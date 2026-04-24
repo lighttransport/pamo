@@ -1,3 +1,8 @@
+/* POSIX feature macro: required for clock_gettime / CLOCK_MONOTONIC on glibc. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 /*
  * Copyright 2024 Light Transport Entertainment Inc.
  * SPDX-License-Identifier: Apache-2.0
@@ -19,8 +24,13 @@
 #endif
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
+#ifdef PAMO_USE_PTHREADS
+#include <unistd.h>
+#endif
 #ifdef PAMO_USE_PTHREADS
 #include <pthread.h>
 #endif
@@ -142,10 +152,31 @@ static float ray_tri_hitf(float ox, float oy, float oz,
 
 /* ── Main SDF computation ────────────────────────────────────────── */
 
+/* Phase profiling: set PAMO_SDF_PROFILE=1 to print per-phase wall time. */
+static int pamo_sdf_profile_on(void) {
+    static int checked = 0, on = 0;
+    if (!checked) { const char *e = getenv("PAMO_SDF_PROFILE");
+                    on = (e && e[0] == '1'); checked = 1; }
+    return on;
+}
+static double pamo_sdf_now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
 pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                             pamo_vec3d grid_origin, double voxel_size,
                             const pamo_mesh *m, const pamo_bvh *bvh) {
     if (!grid_out || R < 2 || !m) return PAMO_ERR_INVALID_ARG;
+    int prof = pamo_sdf_profile_on();
+    double t0 = prof ? pamo_sdf_now_s() : 0.0;
+    double tprev = t0;
+    #define PAMO_SDF_TICK(label) do { \
+        if (prof) { double _t = pamo_sdf_now_s(); \
+            fprintf(stderr, "[sdf-prof] %-22s %.3f s\n", (label), _t - tprev); \
+            tprev = _t; } \
+    } while (0)
 
     /* Guard against integer overflow: R^3 * sizeof(float) must fit in size_t.
      * R=1290 gives 1290^3*4 = ~8.6 GB. Cap at 1024 for safety. */
@@ -165,6 +196,7 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
 
     /* Initialize distance to large value. */
     for (size_t i = 0; i < grid_size; i++) dist[i] = 1e9f;
+    PAMO_SDF_TICK("alloc+init");
 
     /* ── Active-voxel mask (hierarchical band clip) ───────────────
      * Only voxels whose grid cell intersects a triangle's AABB expanded
@@ -207,15 +239,45 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                         active[GRID_IDX(ix, iy, iz, R)] = 1;
         }
     }
+    PAMO_SDF_TICK("active-mask");
+
+    /* ── BVH backend selection ───────────────────────────────────────
+     * Runtime toggle between the vendored lightrt BVH (faster, tighter
+     * fit) and pamo's fallback BVH. Callers can force the fallback by
+     * setting PAMO_USE_FALLBACK_BVH=1 — useful when the lightrt path's
+     * smoother narrow-band distances over-simplify concave features
+     * that the looser fallback distances preserve. Requires pamo to be
+     * compiled with PAMO_USE_LIGHTRT; otherwise the fallback is the
+     * only option. */
+    int use_lightrt = 0;
+#ifdef PAMO_USE_LIGHTRT
+    lightrt_bvh *lbvh = NULL;
+    {
+        const char *e = getenv("PAMO_USE_FALLBACK_BVH");
+        use_lightrt = !(e && e[0] == '1');
+    }
+    if (use_lightrt) {
+        lbvh = build_lightrt_from_mesh(m);
+        if (!lbvh) use_lightrt = 0;  /* graceful fallback on alloc failure */
+    }
+#endif
 
     /* ── Phase 1: Narrow-band distance computation ───────────────── */
+    if (use_lightrt) {
 #ifdef PAMO_USE_LIGHTRT
-    lightrt_bvh *lbvh = build_lightrt_from_mesh(m);
-    if (!lbvh) { free(dist); free(collide); free(active); return PAMO_ERR_ALLOC; }
-    {
         float band_sq = band * band;
 #ifdef PAMO_USE_PTHREADS
-        int nt = 8;
+        /* Thread count: env override PAMO_NUM_THREADS, else online CPUs
+         * (clamped to [1, R]; per-z-slab partition gives at most R tasks). */
+        int nt = 0;
+        const char *ev = getenv("PAMO_NUM_THREADS");
+        if (ev && ev[0]) nt = atoi(ev);
+        if (nt <= 0) {
+            long on = sysconf(_SC_NPROCESSORS_ONLN);
+            nt = (on > 0) ? (int)on : 8;
+        }
+        if (nt > R) nt = R;
+        if (nt < 1) nt = 1;
         pthread_t *thr = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
         sdf_worker_arg *args = (sdf_worker_arg *)malloc((size_t)nt * sizeof(sdf_worker_arg));
         int32_t per = (R + nt - 1) / nt;
@@ -239,31 +301,31 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                     float p[3] = {gox+((float)ix+0.5f)*vs, goy+((float)iy+0.5f)*vs, goz+((float)iz+0.5f)*vs};
                     dist[idx] = sqrtf(lightrt_bvh_nearest_bounded(lbvh, p, band_sq));
                 }
-#endif
+#endif /* PAMO_USE_PTHREADS */
+#endif /* PAMO_USE_LIGHTRT */
+    } else {
+        /* Fallback: pamo BVH. */
+        for (int32_t iz = 0; iz < R; iz++)
+            for (int32_t iy = 0; iy < R; iy++)
+                for (int32_t ix = 0; ix < R; ix++) {
+                    size_t idx = GRID_IDX(ix,iy,iz,R);
+                    if (!active[idx]) continue;
+                    pamo_vec3d p = {grid_origin.x+((double)ix+0.5)*voxel_size,
+                                    grid_origin.y+((double)iy+0.5)*voxel_size,
+                                    grid_origin.z+((double)iz+0.5)*voxel_size};
+                    pamo_nearest_result res;
+                    pamo_bvh_nearest(bvh, m, p, &res);
+                    float d = (float)sqrt(res.dist_sq);
+                    if (d < band) dist[idx] = d;
+                }
     }
-    /* lbvh reused for Phase 2 below, destroyed after. */
-#else
-    /* Fallback: pamo BVH. */
-    for (int32_t iz = 0; iz < R; iz++)
-        for (int32_t iy = 0; iy < R; iy++)
-            for (int32_t ix = 0; ix < R; ix++) {
-                size_t idx = GRID_IDX(ix,iy,iz,R);
-                if (!active[idx]) continue;
-                pamo_vec3d p = {grid_origin.x+((double)ix+0.5)*voxel_size,
-                                grid_origin.y+((double)iy+0.5)*voxel_size,
-                                grid_origin.z+((double)iz+0.5)*voxel_size};
-                pamo_nearest_result res;
-                pamo_bvh_nearest(bvh, m, p, &res);
-                float d = (float)sqrt(res.dist_sq);
-                if (d < band) dist[idx] = d;
-            }
-#endif
+    PAMO_SDF_TICK("phase1-nearest");
 
     /* ── Phase 2: Collision flags (3-axis ray tests for near-surface voxels) */
     float rayth = vs + 1e-6f;
+    if (use_lightrt) {
 #ifdef PAMO_USE_LIGHTRT
-    /* Reuse lbvh from Phase 1. */
-    {
+        /* Reuse lbvh from Phase 1. */
         if (lbvh) {
             for (int32_t iz = 0; iz < R; iz++)
                 for (int32_t iy = 0; iy < R; iy++)
@@ -286,8 +348,8 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                     }
             lightrt_bvh_destroy(lbvh);
         }
-    }
-#else
+#endif
+    } else {
     /* Fallback: for each near-surface voxel, query the BVH for triangles
      * whose AABB overlaps the voxel (+ rayth margin along +X/+Y/+Z so all
      * three short axis-aligned rays get a candidate list), then ray-test
@@ -353,7 +415,8 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                 }
         pamo_overlap_result_destroy(&ov);
     }
-#endif
+    }
+    PAMO_SDF_TICK("phase2-rays");
 
     /* ── Phase 3: Union-Find sign determination ──────────────────── */
     /* Node 0 = boundary sentinel. Nodes 1..N^3 = voxels. */
@@ -420,9 +483,14 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
         grid_out[i] = (root != boundary_root) ? -(double)d : (double)d;
     }
 
+    PAMO_SDF_TICK("phase3-sign");
+    if (prof) fprintf(stderr, "[sdf-prof] %-22s %.3f s (R=%d)\n",
+                      "TOTAL", pamo_sdf_now_s() - t0, R);
+
     free(parent);
     free(collide);
     free(dist);
     free(active);
     return PAMO_OK;
 }
+#undef PAMO_SDF_TICK

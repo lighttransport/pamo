@@ -8,10 +8,24 @@
 #include "pamo_types.h"
 #include "pamo_alloc.h"
 #include "pamo_mesh.h"
+#include "pamo_bvh.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Compute a signed distance field (double, R^3) of `m` on a uniform
+ * cubic grid (origin = `grid_origin`, voxel size = `voxel_size`,
+ * resolution = R). `bvh` must be a triangle-BVH built over `m` (use
+ * pamo_bvh_build_triangles); pass NULL only if `m` is small enough
+ * that brute-force suffices.
+ *
+ * Used internally by pamo_remesh; exposed here so external callers
+ * (e.g. lgphys's offline SDF builder) can reuse the lightrt-accelerated
+ * path without pulling pamo_remesh's marching-cubes machinery. */
+pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
+                            pamo_vec3d grid_origin, double voxel_size,
+                            const pamo_mesh *m, const pamo_bvh *bvh);
 
 typedef struct {
     int32_t resolution;   /* SDF grid resolution (default 256) */

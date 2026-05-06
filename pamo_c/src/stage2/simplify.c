@@ -7,6 +7,7 @@
 #include "pamo/pamo_stage2.h"
 #include "pamo/pamo_bvh.h"
 #include "pamo/pamo_internal.h"
+#include "pamo/pamo_progress.h"
 
 #include <math.h>
 #include <string.h>
@@ -513,9 +514,17 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
     int32_t stuck_counter = 0;
     double cost_limit = opts->cost_range;
+    pamo_emit_progress("simplify_start", 0,
+                       (int64_t)pamo_mesh_count_alive_faces(mesh));
 
     for (int32_t iter = 0; iter < opts->max_iters; iter++) {
         size_t alive_faces = pamo_mesh_count_alive_faces(mesh);
+        /* Report progress as faces collapsed against (initial - target).
+         * `iter` flows in the `current` slot too — useful when the bar
+         * needs to advance while we're still far from the target. */
+        pamo_emit_progress("simplify_iter",
+                           (int64_t)alive_faces,
+                           (int64_t)opts->target_faces);
         if ((int32_t)alive_faces <= opts->target_faces) break;
         if ((int32_t)alive_faces <= opts->min_faces) break;
 

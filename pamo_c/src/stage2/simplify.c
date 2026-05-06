@@ -429,7 +429,16 @@ static pamo_error simplify_round(pamo_mesh *m,
      * Re-check the link condition before each collapse since
      * earlier collapses in this round may have changed topology. */
     size_t actually_collapsed = 0;
+    /* Sub-iter progress emit cadence — every PROGRESS_CADENCE iterations
+     * of this loop. 256 keeps emit overhead negligible while making the
+     * Blender bar tick visibly during multi-second outer rounds.        */
+    const size_t PROGRESS_CADENCE = 256;
+    pamo_emit_progress("simplify_collapse", 0, (int64_t)n_accepted);
     for (size_t i = 0; i < n_accepted; i++) {
+        if ((i % PROGRESS_CADENCE) == 0 && i > 0) {
+            pamo_emit_progress("simplify_collapse", (int64_t)i,
+                               (int64_t)n_accepted);
+        }
         int32_t u = records[i].u, v = records[i].v;
         if (!m->vert_alive[u] || !m->vert_alive[v]) continue;
 

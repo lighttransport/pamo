@@ -11,7 +11,6 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { parse as parseObj, bounds, weldVertices } from '/shared/obj.mjs';
 import { vertexDistances } from '/shared/kdtree.mjs';
 import { colourise, distanceStats } from '/shared/colormap.mjs';
-import { loadPamo } from '/shared/pamo_runner.mjs';
 
 // ── Scene helpers ────────────────────────────────────────────────────
 
@@ -137,7 +136,7 @@ const state = {
     inputBounds: null,
     pamo: null,         // {verts, faces, ms}
     pamoC: null,        // {verts, faces, ms}
-    runner: null,
+    worker: null,
 };
 
 const vps = {
@@ -276,12 +275,48 @@ function loadInput(text, name) {
 
 // ── Run pipelines ────────────────────────────────────────────────────
 
-async function ensureRunner() {
-    if (!state.runner) {
-        setStatus('loading WASM…', 'busy');
-        state.runner = await loadPamo('/wasm/pamo.mjs');
+// Worker that runs pamo_c off the main thread, so the UI keeps painting
+// during long simplifications. Lazily created on first use.
+function ensureWorker() {
+    if (!state.worker) {
+        state.worker = new Worker('/shared/pamo_worker.mjs', { type: 'module' });
     }
-    return state.runner;
+    return state.worker;
+}
+
+let nextRunId = 1;
+
+// Send the input mesh to the worker, stream `onProgress(stage, pct,
+// alive, target)` to the caller, and resolve with {verts, faces, ms}
+// when the worker posts 'done'.
+function runInWorker(verts, faces, opts, onProgress) {
+    const worker = ensureWorker();
+    const id = nextRunId++;
+    return new Promise((resolve, reject) => {
+        const onMsg = (e) => {
+            const m = e.data;
+            if (!m || m.id !== id) return;
+            if (m.type === 'progress') {
+                onProgress?.(m.stage, m.pct, m.alive, m.target);
+            } else if (m.type === 'done') {
+                worker.removeEventListener('message', onMsg);
+                resolve({ verts: m.verts, faces: m.faces, ms: m.ms });
+            } else if (m.type === 'error') {
+                worker.removeEventListener('message', onMsg);
+                reject(new Error(m.message));
+            }
+        };
+        worker.addEventListener('message', onMsg);
+        // The input arrays must remain usable on the main thread (we
+        // re-render them and KD-tree against them later), so copy
+        // before sending — don't transfer.
+        worker.postMessage({
+            type: 'run', id,
+            verts: verts.slice(),
+            faces: faces.slice(),
+            opts,
+        });
+    });
 }
 
 async function run() {
@@ -342,30 +377,20 @@ async function runPython(opts) {
 }
 
 async function runWasm(opts) {
-    const runner = await ensureRunner();
-    // Surface C-side progress in the status bar. RAF-throttled so the
-    // per-iteration callbacks don't pin the layout thread.
-    let pendingMsg = null, scheduled = false;
-    const flush = () => {
-        scheduled = false;
-        if (pendingMsg !== null) setStatus(pendingMsg, 'busy');
-    };
-    return runner.simplify(state.inputMesh.verts, state.inputMesh.faces, {
-        ...opts,
-        onProgress: (stage, pct, alive, target) => {
+    // Surface C-side progress in the status bar live. The worker runs
+    // WASM off-thread so the main thread can paint between messages.
+    return runInWorker(
+        state.inputMesh.verts, state.inputMesh.faces, opts,
+        (stage, pct, alive, target) => {
             const pctStr = `${(pct * 100).toFixed(0)}%`;
             if (stage === 'stage2' && alive >= 0 && target >= 0) {
-                pendingMsg = `pamo_c stage2: ${pctStr} (${alive}f → target ${target}f)`;
+                setStatus(
+                    `pamo_c stage2: ${pctStr} (${alive}f → target ${target}f)`,
+                    'busy');
             } else {
-                pendingMsg = `pamo_c ${stage}: ${pctStr}`;
+                setStatus(`pamo_c ${stage}: ${pctStr}`, 'busy');
             }
-            if (!scheduled) {
-                scheduled = true;
-                requestAnimationFrame(flush);
-            }
-            return 0;
-        },
-    });
+        });
 }
 
 // ── Diff colouring ───────────────────────────────────────────────────

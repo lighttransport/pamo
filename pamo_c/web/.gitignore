@@ -1,4 +1,9 @@
-# WASM build outputs and intermediate cmake tree
+# Embind WASM build (bootstrap-linux.sh)
+build/
+js/src/
+node_modules/
+
+# Comparison-demo WASM build outputs and intermediate cmake tree
 wasm/build/
 wasm/pamo.mjs
 wasm/pamo.wasm

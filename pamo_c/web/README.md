@@ -1,4 +1,69 @@
-# pamo_c web/CLI demo
+# pamo_c web
+
+This directory hosts two independent WebAssembly entry points:
+
+1. **Embind library build** (`binding.cc`, `embind-utils.hpp`,
+   `bootstrap-linux.sh`, `js/`, `demo/`) — single-threaded WASM with
+   embind bindings exposing `remesh` / `simplify` / `safeProject`
+   directly to JS. Suitable for embedding pamo_c as a library.
+
+2. **Python-vs-WASM comparison demo** (`wasm/`, `shared/`, `cli/`,
+   `server/`, `web/`) — three.js viewports that run the original GPU
+   `pamo` (via a local Python HTTP server) and `pamo_c` (WASM) on the
+   same input, with colour-coded per-vertex distance diffs. Includes
+   a Node.js CLI variant.
+
+The two builds are independent: each has its own bootstrap script and
+artifact directory, so you can build either or both.
+
+---
+
+## 1. Embind library build
+
+Single-threaded browser/Node WebAssembly build of pamo_c with embind
+bindings.
+
+### Build
+
+```bash
+# requires emcmake on PATH
+./bootstrap-linux.sh
+# or:  BUILD_TYPE=Debug ./bootstrap-linux.sh
+```
+
+Artifacts land in `js/src/pamo.{js,wasm}`.
+
+### Usage
+
+```js
+import { loadPamo } from './js/PamoLoader.js';
+const pamo = await loadPamo();
+
+// Stage 1 — volumetric remeshing
+const r = pamo.remesh(vertices, indices, { resolution: 64 });
+// r: { vertices: Float64Array, indices: Int32Array, error: "OK" | ... }
+
+// Stage 2 — iterative simplification
+const s = pamo.simplify(r.vertices, r.indices, { target_faces: 500 });
+
+// Stage 3 — SAFE projection back toward a ground-truth mesh
+const f = pamo.safeProject(s.vertices, s.indices, gtV, gtI, {
+  n_outer_iters: 3,
+});
+```
+
+### Notes
+
+- Single-threaded: `PAMO_USE_PTHREADS=OFF`, `PAMO_USE_LIGHTRT=OFF`.
+- The native `pamo_allocator` is **not** exposed to JS; the bindings use
+  `pamo_default_allocator()` internally.
+- Input / output meshes are flat typed arrays
+  (`Float64Array` verts, `Int32Array` indices). The binding compacts
+  internally before returning, so dead verts/faces are already gone.
+
+---
+
+## 2. Python-vs-WASM comparison demo
 
 Two zero-install ways to compare the original Python `pamo` against the
 C-port `pamo_c`:
@@ -22,7 +87,7 @@ pamo_c/web/
 └── web/       index.html + styles.css + app.mjs      three.js demo
 ```
 
-## Prerequisites
+### Prerequisites
 
 - **Emscripten** for the WASM build. Activate it with e.g.
   `source /mnt/nvme02/work/emsdk/emsdk_env.sh`.
@@ -30,7 +95,7 @@ pamo_c/web/
 - The repo's CUDA Python venv (`.venv-cuda12` from `setup_uv_cuda12.sh`)
   for anything that calls the original `pamo` package.
 
-## 1. Build the WASM module
+### 2.1 Build the WASM module
 
 ```sh
 cd pamo_c/web/wasm
@@ -39,7 +104,7 @@ cd pamo_c/web/wasm
 
 Outputs `pamo.mjs` (~9 KB) and `pamo.wasm` (~60 KB).
 
-## 2. Node.js CLI
+### 2.2 Node.js CLI
 
 ```sh
 cd pamo_c/web/cli
@@ -70,7 +135,7 @@ Useful flags:
 - `--skip-python`, `--skip-wasm` — reuse cached outputs in `out/`.
 - `--python-bin` — override the Python interpreter.
 
-## 3. Browser demo
+### 2.3 Browser demo
 
 Start the server with the CUDA venv (so the `/process` endpoint can import
 `pamo`):
@@ -91,7 +156,7 @@ to re-run both pipelines. The **View** dropdown switches between:
 The three OrbitControls cameras are linked, so dragging in any viewport
 rotates all three.
 
-## Notes
+### Notes
 
 - "Geometric diff" is **per-vertex distance to the nearest vertex of the
   reference mesh** (KD-tree). Same metric as `pamo_c/verify/verify_main.c`.
@@ -103,7 +168,7 @@ rotates all three.
 - The demo server is HTTP only (no auth), bound to `127.0.0.1`. Don't
   expose it.
 
-## Re-running the verification suite
+### Re-running the verification suite
 
 The earlier `pamo_c/verify/verify_compare.py` script is independent of
 this directory and still works:

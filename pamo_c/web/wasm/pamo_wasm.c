@@ -184,6 +184,12 @@ int pamo_wasm_run(const float *verts, int32_t n_verts,
         pamo_simplify_opts opts = pamo_simplify_opts_default();
         opts.target_faces = target_faces;
         opts.preserve_boundary = (preserve_boundary != 0);
+        /* Enable rollback of collapses that produce self-intersecting
+         * geometry. The C-library default is false (faster), but at
+         * aggressive ratios (e.g. 0.05) skipping the check produces
+         * visible tri-tri intersections at high-curvature regions
+         * (BirdHouse base corners). Cost is ~5-15% extra wall time. */
+        opts.check_self_intersection = true;
         opts.progress_cb = simplify_progress;
         e = pamo_simplify(&mesh, &opts);
         if (e != PAMO_OK) {

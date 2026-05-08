@@ -300,6 +300,91 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
     return qerr + edge_cost + skinny_cost;
 }
 
+/* Predict whether collapsing edge (u,v) onto `mid` would produce a
+ * self-intersecting 1-ring. Returns true if intersection detected.
+ *
+ * Approach: enumerate the post-collapse triangles (faces incident to
+ * u or v, minus the shared faces that die, with each occurrence of v
+ * remapped to u). Pairwise-test triangles that don't share any vertex
+ * (adjacent ones legitimately touch along their shared edge — the
+ * tri-tri test would flag that as 'intersection'). Skip any post-
+ * collapse triangle that became degenerate (collinear vertices).
+ *
+ * Cost: O(K^2) tri-tri tests with K = 1-ring face count, typically
+ * ≤ 20. Only invoked when opts->check_self_intersection is on, and
+ * only for the small subset of edges that pass the cheaper pre-checks
+ * above. */
+static bool collapse_self_intersects(const pamo_mesh *m,
+                                     int32_t u, int32_t v,
+                                     pamo_vec3d mid) {
+    /* Gather post-collapse triangles into a fixed-size scratch.
+     * 1-ring valence is bounded by PAMO_MAX_VALENCE (256). */
+    pamo_vec3d tri_v[PAMO_MAX_VALENCE * 2][3];
+    int32_t    tri_orig[PAMO_MAX_VALENCE * 2][3];   /* pre-remap ids */
+    int32_t    n_tri = 0;
+
+    for (int pass = 0; pass < 2; pass++) {
+        int32_t endpoint = (pass == 0) ? u : v;
+        int32_t other    = (pass == 0) ? v : u;
+        int32_t s = m->vert_face_offset[endpoint];
+        int32_t e = m->vert_face_offset[endpoint + 1];
+        for (int32_t i = s; i < e; i++) {
+            int32_t fi = m->vert_face_list[i];
+            if (!m->face_alive[fi]) continue;
+            const int32_t *fv = m->faces[fi].v;
+            /* Shared face dies. Skip from second pass to avoid dupes. */
+            if (fv[0] == other || fv[1] == other || fv[2] == other) continue;
+            if (pass == 1) {
+                /* On v's pass, also skip faces already enumerated under u. */
+                bool seen = false;
+                for (int32_t k = 0; k < n_tri && !seen; k++) {
+                    if (tri_orig[k][0] == fv[0] &&
+                        tri_orig[k][1] == fv[1] &&
+                        tri_orig[k][2] == fv[2]) seen = true;
+                }
+                if (seen) continue;
+            }
+            if (n_tri >= PAMO_MAX_VALENCE * 2) return true;  /* conservative */
+            for (int k = 0; k < 3; k++) {
+                tri_orig[n_tri][k] = fv[k];
+                int32_t vid = (fv[k] == endpoint) ? endpoint
+                            : (fv[k] == v        ? u
+                                                 : fv[k]);
+                tri_v[n_tri][k] = (fv[k] == endpoint) ? mid : m->verts[vid];
+            }
+            /* Drop degenerate (vertices coincident after remap). */
+            if (pamo_v3_length_sq(pamo_v3_sub(tri_v[n_tri][1], tri_v[n_tri][0])) < 1e-30 ||
+                pamo_v3_length_sq(pamo_v3_sub(tri_v[n_tri][2], tri_v[n_tri][1])) < 1e-30 ||
+                pamo_v3_length_sq(pamo_v3_sub(tri_v[n_tri][0], tri_v[n_tri][2])) < 1e-30) {
+                continue;
+            }
+            n_tri++;
+        }
+    }
+
+    /* Pairwise test triangles that don't share a (post-remap) vertex. */
+    for (int32_t i = 0; i < n_tri; i++) {
+        for (int32_t j = i + 1; j < n_tri; j++) {
+            /* Build effective vertex IDs (post v→u remap). */
+            int32_t ai[3], bi[3];
+            for (int k = 0; k < 3; k++) {
+                ai[k] = (tri_orig[i][k] == v) ? u : tri_orig[i][k];
+                bi[k] = (tri_orig[j][k] == v) ? u : tri_orig[j][k];
+            }
+            bool share = false;
+            for (int a = 0; a < 3 && !share; a++)
+                for (int b = 0; b < 3 && !share; b++)
+                    if (ai[a] == bi[b]) share = true;
+            if (share) continue;
+            if (pamo_tri_tri_intersect(tri_v[i][0], tri_v[i][1], tri_v[i][2],
+                                       tri_v[j][0], tri_v[j][1], tri_v[j][2])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* ── Collapse record for undo ────────────────────────────────────── */
 
 typedef struct {
@@ -531,6 +616,10 @@ static pamo_error simplify_round(pamo_mesh *m,
         pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
         pamo_vec3d mid = choose_placement(&Qsum, m->verts[u],
                                           m->verts[v], scale);
+        if (opts->check_self_intersection &&
+            collapse_self_intersects(m, u, v, mid)) {
+            continue;   /* would tear the mesh; skip this collapse */
+        }
         apply_collapse(m, u, v, mid);
         /* Propagate the quadric to the surviving vertex. v dies, u
          * lives — keep its accumulated error so subsequent rounds

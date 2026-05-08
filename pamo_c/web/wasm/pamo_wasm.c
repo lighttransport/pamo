@@ -16,8 +16,28 @@
 #include "pamo/pamo.h"
 
 #include <emscripten.h>
+#include <emscripten/em_js.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Calls globalThis.__pamoProgress(stage, pct, alive, target) if defined.
+ * pct is in [0,1]; alive/target are -1 when unknown (e.g. stage start). */
+EM_JS(int, pamo_js_progress, (const char *stage, float pct,
+                              int alive, int target), {
+    if (typeof globalThis.__pamoProgress === 'function') {
+        try {
+            return (globalThis.__pamoProgress(UTF8ToString(stage), pct,
+                                              alive, target) | 0);
+        } catch (e) { console.error('[pamo progress cb] ', e); }
+    }
+    return 0;
+});
+
+static int simplify_progress(int32_t iter, int32_t alive, int32_t target,
+                             float pct, void *user) {
+    (void)iter; (void)user;
+    return pamo_js_progress("stage2", pct, alive, target);
+}
 
 typedef struct {
     float   *verts;       /* nv * 3 (x, y, z) — JS reads from HEAPF32   */
@@ -130,10 +150,13 @@ int pamo_wasm_run(const float *verts, int32_t n_verts,
     int32_t target_faces = (int32_t)((double)n_faces * (double)ratio);
     if (target_faces < 10) target_faces = 10;
 
+    pamo_js_progress("input", 1.0f, n_verts, n_faces);
+
     /* Stage 1: optional remesh. R selection mirrors Python (PaMO.run):
      *   default R=256, R=128 if target<=1000, R=64 if target<=50.
      * Caller can override with sdf_resolution > 0. */
     if (use_stage1) {
+        pamo_js_progress("stage1", 0.0f, -1, -1);
         pamo_remesh_opts ropts = pamo_remesh_opts_default();
         if (sdf_resolution > 0) {
             ropts.resolution = sdf_resolution;
@@ -149,14 +172,19 @@ int pamo_wasm_run(const float *verts, int32_t n_verts,
             pamo_mesh_destroy(&remeshed);
         }
         /* If remesh failed, silently fall through with the original mesh. */
+        pamo_js_progress("stage1", 1.0f,
+                         (int32_t)mesh.n_verts, (int32_t)mesh.n_faces);
     }
 
     /* Stage 2: simplify (always). target_faces is the ratio of the *input*
      * mesh, regardless of how big the Stage 1 output ended up. */
     {
+        pamo_js_progress("stage2", 0.0f,
+                         (int32_t)mesh.n_faces, target_faces);
         pamo_simplify_opts opts = pamo_simplify_opts_default();
         opts.target_faces = target_faces;
         opts.preserve_boundary = (preserve_boundary != 0);
+        opts.progress_cb = simplify_progress;
         e = pamo_simplify(&mesh, &opts);
         if (e != PAMO_OK) {
             pamo_mesh_destroy(&mesh);
@@ -165,8 +193,12 @@ int pamo_wasm_run(const float *verts, int32_t n_verts,
         }
     }
 
+    pamo_js_progress("stage2", 1.0f,
+                     (int32_t)mesh.n_faces, target_faces);
+
     /* Stage 3: optional SAFE projection against the original geometry. */
     if (use_stage3) {
+        pamo_js_progress("stage3", 0.0f, -1, -1);
         pamo_mesh gt;
         pamo_error g = build_mesh(&gt, &alloc, verts, n_verts, faces, n_faces);
         if (g == PAMO_OK) {
@@ -174,6 +206,7 @@ int pamo_wasm_run(const float *verts, int32_t n_verts,
             (void)pamo_safe_project(&mesh, &gt, &sopts, &alloc);
             pamo_mesh_destroy(&gt);
         }
+        pamo_js_progress("stage3", 1.0f, -1, -1);
     }
 
     int rc = flatten_to_result(&mesh);

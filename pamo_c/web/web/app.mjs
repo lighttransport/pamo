@@ -168,6 +168,12 @@ const ui = {
 
 function ratioFromSlider() { return Math.pow(10, +ui.ratio.value); }
 
+function fmtTime(ms) {
+    if (ms < 1000) return `${Math.round(ms)} ms`;
+    if (ms < 10_000) return `${(ms / 1000).toFixed(2)} s`;
+    return `${(ms / 1000).toFixed(1)} s`;
+}
+
 function setStatus(text, cls = '') {
     ui.status.className = `status ${cls}`;
     ui.status.textContent = text;
@@ -298,8 +304,8 @@ async function run() {
         ]);
         state.pamo  = pamoRes;
         state.pamoC = wasmRes;
-        setInfo('pamo',   `${pamoRes.verts.length/3}v ${pamoRes.faces.length/3}f  ${Math.round(pamoRes.ms)} ms`);
-        setInfo('pamo_c', `${wasmRes.verts.length/3}v ${wasmRes.faces.length/3}f  ${Math.round(wasmRes.ms)} ms`);
+        setInfo('pamo',   `${pamoRes.verts.length/3}v ${pamoRes.faces.length/3}f  ${fmtTime(pamoRes.ms)}`);
+        setInfo('pamo_c', `${wasmRes.verts.length/3}v ${wasmRes.faces.length/3}f  ${fmtTime(wasmRes.ms)}`);
         recolour();
         setStatus('ok', 'ok');
     } catch (e) {
@@ -337,7 +343,29 @@ async function runPython(opts) {
 
 async function runWasm(opts) {
     const runner = await ensureRunner();
-    return runner.simplify(state.inputMesh.verts, state.inputMesh.faces, opts);
+    // Surface C-side progress in the status bar. RAF-throttled so the
+    // per-iteration callbacks don't pin the layout thread.
+    let pendingMsg = null, scheduled = false;
+    const flush = () => {
+        scheduled = false;
+        if (pendingMsg !== null) setStatus(pendingMsg, 'busy');
+    };
+    return runner.simplify(state.inputMesh.verts, state.inputMesh.faces, {
+        ...opts,
+        onProgress: (stage, pct, alive, target) => {
+            const pctStr = `${(pct * 100).toFixed(0)}%`;
+            if (stage === 'stage2' && alive >= 0 && target >= 0) {
+                pendingMsg = `pamo_c stage2: ${pctStr} (${alive}f → target ${target}f)`;
+            } else {
+                pendingMsg = `pamo_c ${stage}: ${pctStr}`;
+            }
+            if (!scheduled) {
+                scheduled = true;
+                requestAnimationFrame(flush);
+            }
+            return 0;
+        },
+    });
 }
 
 // ── Diff colouring ───────────────────────────────────────────────────

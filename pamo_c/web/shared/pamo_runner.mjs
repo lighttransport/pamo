@@ -24,12 +24,20 @@ class PamoRunner {
     // Run simplification on the given input mesh.
     //   verts: Float32Array (xyz triplets)
     //   faces: Int32Array (triangle indices)
-    //   opts:  { ratio, useStage1, useStage3, sdfResolution, preserveBoundary }
+    //   opts:  { ratio, useStage1, useStage3, sdfResolution,
+    //            preserveBoundary, onProgress }
     //          sdfResolution = 0 (default) → auto (Python rules: 256/128/64)
     //                        = positive int → force that R for Stage 1
     //          preserveBoundary = false (default) → don't lock one-face-edge
     //                             verts. Set true for watertight inputs with
     //                             intentional cracks you don't want widened.
+    //          onProgress(stage, pct, alive, target) → called from C-side at
+    //                     stage boundaries ("stage1"/"stage2"/"stage3", with
+    //                     pct=0 on entry and pct=1 on exit) and per-iteration
+    //                     during Stage 2 (pct in (0,1)). Return non-zero to
+    //                     request soft-cancel of Stage 2 (other stages
+    //                     aren't cancellable). alive/target are -1 when
+    //                     unknown.
     // Returns { verts: Float32Array, faces: Int32Array, ms: number }.
     simplify(verts, faces, {
         ratio = 0.1,
@@ -37,6 +45,7 @@ class PamoRunner {
         useStage3 = false,
         sdfResolution = 0,
         preserveBoundary = false,
+        onProgress = null,
     } = {}) {
         const M = this.M;
         const nv = (verts.length / 3) | 0;
@@ -49,10 +58,14 @@ class PamoRunner {
         const fBytes = faces.length * 4;
         const vPtr = M._malloc(vBytes);
         const fPtr = M._malloc(fBytes);
+        // C side calls globalThis.__pamoProgress(stage, pct, alive, target).
+        const prevHook = globalThis.__pamoProgress;
+        if (onProgress) {
+            globalThis.__pamoProgress = onProgress;
+        }
         try {
             M.HEAPF32.set(verts, vPtr >> 2);
             M.HEAP32.set(faces, fPtr >> 2);
-
             const t0 = (typeof performance !== 'undefined' ? performance : Date).now();
             const rc = M._pamo_wasm_run(
                 vPtr, nv,
@@ -86,6 +99,7 @@ class PamoRunner {
             M._free(vPtr);
             M._free(fPtr);
             M._pamo_wasm_reset();
+            if (onProgress) globalThis.__pamoProgress = prevHook;
         }
     }
 }

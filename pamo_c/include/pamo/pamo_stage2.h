@@ -13,6 +13,16 @@
 extern "C" {
 #endif
 
+/* Progress callback. Called from inside the iteration loop after each
+ * compact(). `pct` is in [0, 1] (0 = first iter, 1 = target reached
+ * or loop exited). Return non-zero to request early termination
+ * (currently observed as a soft cancel). NULL = no callback. */
+typedef int (*pamo_simplify_progress_cb)(int32_t iter,
+                                         int32_t alive_faces,
+                                         int32_t target_faces,
+                                         float pct,
+                                         void *user);
+
 typedef struct {
     int32_t target_faces;           /* stop when face_count <= target */
     int32_t min_faces;              /* absolute minimum (default 10) */
@@ -28,6 +38,8 @@ typedef struct {
                                        cracks/seams in the input are not
                                        widened by collapses near them.
                                        Default: true. */
+    pamo_simplify_progress_cb progress_cb;  /* optional, NULL by default */
+    void   *progress_user;                  /* opaque pointer passed to cb */
 } pamo_simplify_opts;
 
 pamo_simplify_opts pamo_simplify_opts_default(void);

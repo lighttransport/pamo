@@ -14,7 +14,7 @@
 #include <stdio.h>
 
 pamo_simplify_opts pamo_simplify_opts_default(void) {
-    return (pamo_simplify_opts){
+    pamo_simplify_opts o = {
         .target_faces            = 100,
         .min_faces               = 10,
         .max_iters               = 100,
@@ -25,7 +25,10 @@ pamo_simplify_opts pamo_simplify_opts_default(void) {
         .cost_range              = 10.0,
         .check_self_intersection = false,
         .preserve_boundary       = true,
+        .progress_cb             = NULL,
+        .progress_user           = NULL,
     };
+    return o;
 }
 
 /* Upper bound on 1-ring valence we handle on the stack. Real meshes
@@ -534,6 +537,7 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
     int32_t stuck_counter = 0;
     double cost_limit = opts->cost_range;
+    int32_t initial_alive = (int32_t)pamo_mesh_count_alive_faces(mesh);
 
     /* If preserve_boundary, lock every vertex that touches a boundary edge
      * (an edge with only one incident face). Without this, the simplifier
@@ -587,6 +591,19 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
         } else {
             stuck_counter = 0;
             cost_limit = opts->cost_range;
+        }
+
+        if (opts->progress_cb) {
+            int32_t denom = initial_alive - opts->target_faces;
+            float pct = (denom > 0)
+                ? ((float)(initial_alive - (int32_t)new_alive) / (float)denom)
+                : 1.0f;
+            if (pct < 0.0f) pct = 0.0f;
+            if (pct > 1.0f) pct = 1.0f;
+            int rc = opts->progress_cb(iter, (int32_t)new_alive,
+                                       opts->target_faces, pct,
+                                       opts->progress_user);
+            if (rc != 0) break;   /* caller-requested early stop */
         }
 
         if (stuck_counter >= opts->tolerance) break;

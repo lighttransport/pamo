@@ -154,6 +154,7 @@ const ui = {
     ratioVal:  document.getElementById('ratio-val'),
     stage1:    document.getElementById('stage1'),
     stage3:    document.getElementById('stage3'),
+    preserveBoundary: document.getElementById('preserve-boundary'),
     sdfR:      document.getElementById('sdf-r'),
     cscale:    document.getElementById('cscale'),
     cscaleVal: document.getElementById('cscale-val'),
@@ -276,6 +277,7 @@ async function run() {
         useStage1: ui.stage1.checked,
         useStage3: ui.stage3.checked,
         sdfResolution: parseInt(ui.sdfR.value, 10) || 0,  // 0 = auto
+        preserveBoundary: ui.preserveBoundary.checked,
     };
 
     try {

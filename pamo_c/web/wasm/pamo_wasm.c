@@ -98,13 +98,21 @@ static int flatten_to_result(pamo_mesh *m) {
  * the duration of this call (they're read once and copied internally).
  *
  * sdf_resolution: 0 = auto-pick (matches Python: 256/128/64 by target).
- *                 Positive values force that grid resolution for Stage 1. */
+ *                 Positive values force that grid resolution for Stage 1.
+ * preserve_boundary: lock vertices on one-face edges. The C library defaults
+ *                    this to true (good for watertight inputs with intentional
+ *                    cracks/seams), but most demo inputs are non-watertight
+ *                    consumer scans where every internal seam is a "boundary"
+ *                    — locking starves the simplifier and stalls reduction
+ *                    well before the target. WASM ABI exposes it explicitly
+ *                    so the caller can pick. */
 EMSCRIPTEN_KEEPALIVE
 int pamo_wasm_run(const float *verts, int32_t n_verts,
                   const int32_t *faces, int32_t n_faces,
                   float ratio,
                   int use_stage1, int use_stage3,
-                  int sdf_resolution) {
+                  int sdf_resolution,
+                  int preserve_boundary) {
     if (!verts || !faces || n_verts <= 0 || n_faces <= 0 || ratio <= 0.0f) {
         return -1;
     }
@@ -148,6 +156,7 @@ int pamo_wasm_run(const float *verts, int32_t n_verts,
     {
         pamo_simplify_opts opts = pamo_simplify_opts_default();
         opts.target_faces = target_faces;
+        opts.preserve_boundary = (preserve_boundary != 0);
         e = pamo_simplify(&mesh, &opts);
         if (e != PAMO_OK) {
             pamo_mesh_destroy(&mesh);

@@ -24,15 +24,19 @@ class PamoRunner {
     // Run simplification on the given input mesh.
     //   verts: Float32Array (xyz triplets)
     //   faces: Int32Array (triangle indices)
-    //   opts:  { ratio, useStage1, useStage3, sdfResolution }
+    //   opts:  { ratio, useStage1, useStage3, sdfResolution, preserveBoundary }
     //          sdfResolution = 0 (default) → auto (Python rules: 256/128/64)
     //                        = positive int → force that R for Stage 1
+    //          preserveBoundary = false (default) → don't lock one-face-edge
+    //                             verts. Set true for watertight inputs with
+    //                             intentional cracks you don't want widened.
     // Returns { verts: Float32Array, faces: Int32Array, ms: number }.
     simplify(verts, faces, {
         ratio = 0.1,
         useStage1 = false,
         useStage3 = false,
         sdfResolution = 0,
+        preserveBoundary = false,
     } = {}) {
         const M = this.M;
         const nv = (verts.length / 3) | 0;
@@ -57,6 +61,7 @@ class PamoRunner {
                 useStage1 ? 1 : 0,
                 useStage3 ? 1 : 0,
                 sdfResolution | 0,
+                preserveBoundary ? 1 : 0,
             );
             const ms = ((typeof performance !== 'undefined' ? performance : Date).now() - t0);
             if (rc !== 0) {

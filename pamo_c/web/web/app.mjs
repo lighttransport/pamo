@@ -8,7 +8,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-import { parse as parseObj, bounds } from '/shared/obj.mjs';
+import { parse as parseObj, bounds, weldVertices } from '/shared/obj.mjs';
 import { vertexDistances } from '/shared/kdtree.mjs';
 import { colourise, distanceStats } from '/shared/colormap.mjs';
 import { loadPamo } from '/shared/pamo_runner.mjs';
@@ -241,11 +241,22 @@ async function loadSample(name) {
 }
 
 function loadInput(text, name) {
-    const mesh = parseObj(text);
+    const raw = parseObj(text);
+    // Weld co-located vertices before sending to either pipeline. Many
+    // OBJs from modellers/scanners ship with duplicate verts on internal
+    // seams, which simplification would otherwise pull apart into
+    // visible cracks (e.g. BirdHouse's bottom panel).
+    const welded = weldVertices(raw.verts, raw.faces);
+    const mesh = { verts: welded.verts, faces: welded.faces, colors: null };
+    if (welded.merged > 0) {
+        console.log(`[obj] welded ${welded.merged} duplicate verts `
+                  + `(${raw.verts.length/3} → ${mesh.verts.length/3})`);
+    }
     state.inputMesh = mesh;
     state.inputBounds = bounds(mesh.verts);
     state.pamo = state.pamoC = null;
-    setInfo('input', `${mesh.verts.length/3}v ${mesh.faces.length/3}f`);
+    setInfo('input', `${mesh.verts.length/3}v ${mesh.faces.length/3}f`
+                   + (welded.merged > 0 ? ` (welded ${welded.merged})` : ''));
     setInfo('pamo', '—');
     setInfo('pamo_c', '—');
     const geo = buildGeometry(mesh.verts.slice(), mesh.faces.slice());

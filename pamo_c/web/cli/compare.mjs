@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { parse as parseObj, serialise as writeObj, bounds } from '../shared/obj.mjs';
+import { parse as parseObj, serialise as writeObj, bounds, weldVertices } from '../shared/obj.mjs';
 import { vertexDistances } from '../shared/kdtree.mjs';
 import { colourise, distanceStats } from '../shared/colormap.mjs';
 import { loadPamo } from '../shared/pamo_runner.mjs';
@@ -172,7 +172,13 @@ async function main() {
 
     // ── Load input ─────────────────────────────────────────────────
     console.log(`[load]   ${args.input}`);
-    const input = parseObj(readFileSync(args.input, 'utf8'));
+    const raw = parseObj(readFileSync(args.input, 'utf8'));
+    const welded = weldVertices(raw.verts, raw.faces);
+    const input = { verts: welded.verts, faces: welded.faces };
+    if (welded.merged > 0) {
+        console.log(`[weld]   merged ${welded.merged} duplicate verts `
+                  + `(${raw.verts.length/3} → ${input.verts.length/3})`);
+    }
     const inputBounds = bounds(input.verts);
     console.log(`[input]  ${input.verts.length / 3} verts, `
               + `${input.faces.length / 3} faces, `

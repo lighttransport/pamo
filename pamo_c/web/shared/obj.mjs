@@ -65,6 +65,65 @@ export function serialise({ verts, faces, colors = null }) {
     return lines.join('\n');
 }
 
+// Weld co-located vertices. Many real-world OBJs (especially scans /
+// modeller exports of multi-part assemblies) ship with duplicate
+// vertices at identical positions but distinct indices, so adjacent
+// faces share a position but not a vertex ID. Simplification then sees
+// the gap between them as a real boundary edge and pulls it open into
+// a visible crack on the output. Welding by quantised position
+// remaps faces onto a single ID per position before downstream
+// processing.
+//
+// `epsRel` is a fraction of the mesh diameter (default 1e-6, ≈ float32
+// precision); positions hashed into the same bucket are merged.
+//
+// Returns { verts, faces, merged }: a new vert/face pair with the
+// duplicates removed, plus the count of merged vertices for logging.
+export function weldVertices(verts, faces, epsRel = 1e-6) {
+    const n = verts.length / 3;
+    if (n === 0) return { verts, faces, merged: 0 };
+    const { diameter } = bounds(verts);
+    const quantum = Math.max(diameter * epsRel, 1e-12);
+    const inv = 1 / quantum;
+
+    const map = new Map();          // "qx|qy|qz" → new vert idx
+    const remap = new Int32Array(n);
+    const newVerts = [];
+
+    for (let i = 0; i < n; i++) {
+        const x = verts[i*3], y = verts[i*3+1], z = verts[i*3+2];
+        const qx = Math.round(x * inv);
+        const qy = Math.round(y * inv);
+        const qz = Math.round(z * inv);
+        const key = `${qx}|${qy}|${qz}`;
+        let nid = map.get(key);
+        if (nid === undefined) {
+            nid = newVerts.length / 3;
+            newVerts.push(x, y, z);
+            map.set(key, nid);
+        }
+        remap[i] = nid;
+    }
+
+    const newFaces = new Int32Array(faces.length);
+    let nf = 0;
+    for (let i = 0; i < faces.length; i += 3) {
+        const a = remap[faces[i]];
+        const b = remap[faces[i+1]];
+        const c = remap[faces[i+2]];
+        if (a === b || b === c || c === a) continue;   // degenerate
+        newFaces[nf++] = a;
+        newFaces[nf++] = b;
+        newFaces[nf++] = c;
+    }
+
+    return {
+        verts: new Float32Array(newVerts),
+        faces: newFaces.subarray(0, nf),
+        merged: n - (newVerts.length / 3),
+    };
+}
+
 // Compute axis-aligned bounding box and diameter of a Float32Array of
 // xyz triplets. Useful for normalising the colour scale across meshes.
 export function bounds(verts) {

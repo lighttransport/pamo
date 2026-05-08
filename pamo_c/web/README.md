@@ -90,7 +90,8 @@ pamo_c/web/
 ### Prerequisites
 
 - **Emscripten** for the WASM build. Activate it with e.g.
-  `source /mnt/nvme02/work/emsdk/emsdk_env.sh`.
+  `source <emsdk>/emsdk_env.sh` (set `EMSDK_DIR` for `run-web-demo.sh`
+  to find a non-default location).
 - **Node.js ≥ 20** (Emscripten ships one at `<emsdk>/node/.../bin/node`).
 - The repo's CUDA Python venv (`.venv-cuda12` from `setup_uv_cuda12.sh`)
   for anything that calls the original `pamo` package.
@@ -141,7 +142,8 @@ Start the server with the CUDA venv (so the `/process` endpoint can import
 `pamo`):
 
 ```sh
-/mnt/nvme02/work/pamo/.venv-cuda12/bin/python pamo_c/web/server/server.py
+# from the repo root
+.venv-cuda12/bin/python pamo_c/web/server/server.py
 ```
 
 Open <http://127.0.0.1:5050/>. Choose a sample (or upload an `.obj`),

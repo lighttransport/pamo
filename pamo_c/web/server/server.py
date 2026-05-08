@@ -13,8 +13,8 @@ The /process endpoint imports the `pamo` package in-process, so this script
 must be launched with the venv that has pamo installed (e.g.
 `<repo>/.venv-cuda12/bin/python`).
 
-Run:
-  /mnt/nvme02/work/pamo/.venv-cuda12/bin/python pamo_c/web/server/server.py
+Run (from the repo root):
+  .venv-cuda12/bin/python pamo_c/web/server/server.py
 Open:
   http://127.0.0.1:5050/
 """

@@ -10,7 +10,8 @@
 # - Forwards extra args (e.g. --port 8000) to server.py.
 #
 # Env overrides:
-#   EMSDK_DIR    — emsdk root (default: /mnt/nvme02/work/emsdk)
+#   EMSDK_DIR    — emsdk root (default: <repo>/../emsdk, i.e. a sibling
+#                  of the repo). Set this if your emsdk lives elsewhere.
 #   PAMO_VENV    — path to a venv to use (overrides auto-pick)
 #   PAMO_PORT    — server port (default: 5050)
 
@@ -19,7 +20,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WEB_ROOT="${REPO_ROOT}/pamo_c/web"
 
-EMSDK_DIR="${EMSDK_DIR:-/mnt/nvme02/work/emsdk}"
+EMSDK_DIR="${EMSDK_DIR:-${REPO_ROOT}/../emsdk}"
 PAMO_PORT="${PAMO_PORT:-5050}"
 
 # ── 1. Build the WASM module if missing ────────────────────────────────

@@ -7,6 +7,8 @@ node_modules/
 wasm/build/
 wasm/pamo.mjs
 wasm/pamo.wasm
+# (parent .gitignore globally ignores `*build*` — un-ignore the script)
+!wasm/build.sh
 
 # Node
 cli/node_modules/

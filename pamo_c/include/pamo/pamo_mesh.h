@@ -57,6 +57,11 @@ void pamo_mesh_free_adjacency(pamo_mesh *m);
  * Invalidates adjacency. */
 pamo_error pamo_mesh_compact(pamo_mesh *m);
 
+/* Like pamo_mesh_compact but also writes the old→new vertex remap into
+ * `map_out` (caller-allocated, sized for the pre-compact m->n_verts).
+ * map_out[i] = new index of old vertex i, or -1 if dead. */
+pamo_error pamo_mesh_compact_with_remap(pamo_mesh *m, int32_t *map_out);
+
 /* Count currently alive faces. */
 size_t pamo_mesh_count_alive_faces(const pamo_mesh *m);
 

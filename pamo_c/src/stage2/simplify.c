@@ -360,6 +360,7 @@ static void apply_collapse(pamo_mesh *m, int32_t u, int32_t v,
 static pamo_error simplify_round(pamo_mesh *m,
                                  const pamo_simplify_opts *opts,
                                  const bool *vert_locked,
+                                 pamo_quadric *Q,
                                  double cost_limit,
                                  bool relax_normals,
                                  size_t *n_collapsed_out) {
@@ -372,11 +373,6 @@ static pamo_error simplify_round(pamo_mesh *m,
         pamo_mesh_free_adjacency(m);
         return PAMO_OK;
     }
-
-    /* Compute quadrics. */
-    pamo_quadric *Q = PAMO_ALLOC_ARRAY(alloc, pamo_quadric, m->n_verts);
-    if (!Q) { pamo_mesh_free_adjacency(m); return PAMO_ERR_ALLOC; }
-    compute_quadrics(m, Q);
 
     /* Compute scale. */
     double scale_sum = 0.0;
@@ -391,7 +387,6 @@ static pamo_error simplify_round(pamo_mesh *m,
     pamo_edge_cost_entry *costs = PAMO_ALLOC_ARRAY(alloc, pamo_edge_cost_entry,
                                                    m->n_edges);
     if (!costs) {
-        PAMO_FREE_ARRAY(alloc, Q, pamo_quadric, m->n_verts);
         pamo_mesh_free_adjacency(m);
         return PAMO_ERR_ALLOC;
     }
@@ -527,6 +522,11 @@ static pamo_error simplify_round(pamo_mesh *m,
         pamo_vec3d mid = choose_placement(&Qsum, m->verts[u],
                                           m->verts[v], scale);
         apply_collapse(m, u, v, mid);
+        /* Propagate the quadric to the surviving vertex. v dies, u
+         * lives — keep its accumulated error so subsequent rounds
+         * see the original-surface plane sum, not just the local
+         * post-collapse geometry. */
+        Q[u] = Qsum;
         actually_collapsed++;
     }
 
@@ -536,7 +536,6 @@ static pamo_error simplify_round(pamo_mesh *m,
 cleanup:
     if (locked) PAMO_FREE_ARRAY(alloc, locked, bool, m->n_verts);
     PAMO_FREE_ARRAY(alloc, costs, pamo_edge_cost_entry, m->n_edges);
-    PAMO_FREE_ARRAY(alloc, Q, pamo_quadric, m->n_verts);
     pamo_mesh_free_adjacency(m);
     return PAMO_OK;
 }
@@ -583,6 +582,22 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
         vert_locked_n = mesh->n_verts;
     }
 
+    /* Allocate the quadric array once and propagate it across iterations.
+     * Recomputing each round from the (already-collapsed) current
+     * geometry would let small drifts feed back into placement choices
+     * — visible as residual wobble on near-planar regions. Standard
+     * Garland-Heckbert keeps Q rooted in the original surface; we set
+     * it up here from the input mesh and update it inside simplify_round
+     * (Q[u] += Q[v] when u absorbs v) and remap across compact below. */
+    pamo_quadric *Q = PAMO_ALLOC_ARRAY(&mesh->alloc, pamo_quadric, mesh->n_verts);
+    size_t Q_cap = mesh->n_verts;
+    if (!Q) {
+        if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
+                                         bool, vert_locked_n);
+        return PAMO_ERR_ALLOC;
+    }
+    compute_quadrics(mesh, Q);
+
     for (int32_t iter = 0; iter < opts->max_iters; iter++) {
         size_t alive_faces = pamo_mesh_count_alive_faces(mesh);
         if ((int32_t)alive_faces <= opts->target_faces) break;
@@ -590,27 +605,52 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
         size_t n_collapsed = 0;
         bool relax = (stuck_counter >= 2); /* relax normals when deeply stuck */
-        pamo_error err = simplify_round(mesh, opts, vert_locked,
+        pamo_error err = simplify_round(mesh, opts, vert_locked, Q,
                                         cost_limit, relax, &n_collapsed);
         if (err != PAMO_OK) {
             if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
                                              bool, vert_locked_n);
+            PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
             return err;
         }
 
-        err = pamo_mesh_compact(mesh);
-        if (err != PAMO_OK) {
+        /* Remap Q across compact: pre-allocate a remap buffer and
+         * compact in place. Then permute Q so Q_new[map[i]] = Q_old[i]
+         * for alive verts. Since map[i] <= i, we can compact in place
+         * by walking forward and overwriting. */
+        size_t pre_compact_nv = mesh->n_verts;
+        int32_t *vmap = PAMO_ALLOC_ARRAY(&mesh->alloc, int32_t, pre_compact_nv);
+        if (!vmap) {
             if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
                                              bool, vert_locked_n);
+            PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
+            return PAMO_ERR_ALLOC;
+        }
+        err = pamo_mesh_compact_with_remap(mesh, vmap);
+        if (err != PAMO_OK) {
+            PAMO_FREE_ARRAY(&mesh->alloc, vmap, int32_t, pre_compact_nv);
+            if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
+                                             bool, vert_locked_n);
+            PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
             return err;
         }
+        for (size_t i = 0; i < pre_compact_nv; i++) {
+            int32_t ni = vmap[i];
+            if (ni >= 0 && (size_t)ni != i) {
+                Q[ni] = Q[i];
+            }
+        }
+        PAMO_FREE_ARRAY(&mesh->alloc, vmap, int32_t, pre_compact_nv);
 
         /* compact() renumbered vertices, so rebuild the lock array. */
         if (opts->preserve_boundary) {
             if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
                                              bool, vert_locked_n);
             vert_locked = build_boundary_lock(mesh);
-            if (!vert_locked) return PAMO_ERR_ALLOC;
+            if (!vert_locked) {
+                PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
+                return PAMO_ERR_ALLOC;
+            }
             vert_locked_n = mesh->n_verts;
         }
 
@@ -642,6 +682,7 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
     if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
                                      bool, vert_locked_n);
+    PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
 
     /* ── Post-process: remove T-junction non-manifold vertices ────── */
     /* Only run this cleanup for non-watertight input meshes.

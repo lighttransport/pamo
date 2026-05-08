@@ -137,6 +137,8 @@ const state = {
     pamo: null,         // {verts, faces, ms}
     pamoC: null,        // {verts, faces, ms}
     worker: null,
+    pythonAvailable: null,    // null = probing, true/false = known
+    pythonReason: '',         // why it's unavailable, if known
 };
 
 const vps = {
@@ -238,6 +240,37 @@ async function fetchSamples() {
     if (samples.length) loadSample(samples[0]);
 }
 
+// Probe whether the server can run Python pamo (CUDA + pamo importable).
+// On a no-CUDA / no-pamo build the demo gracefully runs WASM-only.
+async function probePython() {
+    try {
+        const r = await fetch('/health');
+        if (r.status === 404) {
+            // Old server without /health — fall back to runtime detection
+            // (Promise.allSettled will surface any failure on first run).
+            state.pythonAvailable = null;
+            state.pythonReason = '';
+            console.info('[demo] /health not available; will detect Python at first run');
+            return;
+        }
+        if (!r.ok) {
+            state.pythonAvailable = false;
+            state.pythonReason = `health probe HTTP ${r.status}`;
+        } else {
+            const j = await r.json();
+            state.pythonAvailable = !!j.available;
+            state.pythonReason = j.reason || (j.available ? '' : 'unknown reason');
+        }
+    } catch (e) {
+        state.pythonAvailable = false;
+        state.pythonReason = `health probe failed: ${e.message}`;
+    }
+    if (state.pythonAvailable === false) {
+        console.warn('[demo] Python pamo unavailable:', state.pythonReason);
+        setInfo('pamo', `unavailable — ${state.pythonReason}`);
+    }
+}
+
 async function loadSample(name) {
     setStatus(`loading ${name}…`, 'busy');
     const r = await fetch(`/samples/${encodeURIComponent(name)}`);
@@ -262,7 +295,8 @@ function loadInput(text, name) {
     state.pamo = state.pamoC = null;
     setInfo('input', `${mesh.verts.length/3}v ${mesh.faces.length/3}f`
                    + (welded.merged > 0 ? ` (welded ${welded.merged})` : ''));
-    setInfo('pamo', '—');
+    setInfo('pamo', state.pythonAvailable === false
+        ? `unavailable — ${state.pythonReason}` : '—');
     setInfo('pamo_c', '—');
     const geo = buildGeometry(mesh.verts.slice(), mesh.faces.slice());
     vps.input.setMesh(geo);
@@ -332,23 +366,99 @@ async function run() {
         preserveBoundary: ui.preserveBoundary.checked,
     };
 
+    // Skip Python entirely when we know it's unavailable so the WASM
+    // path runs cleanly. Use Promise.allSettled when we do try Python,
+    // so a per-request CUDA OOM / runtime failure doesn't kill the
+    // pamo_c result that already finished in the worker.
+    const pythonPromise = (state.pythonAvailable === false)
+        ? Promise.resolve({ status: 'rejected',
+                            reason: new Error(state.pythonReason || 'unavailable') })
+        : runPython(opts).then(v => ({ status: 'fulfilled', value: v }),
+                               r => ({ status: 'rejected', reason: r }));
+    const wasmPromise = runWasm(opts).then(v => ({ status: 'fulfilled', value: v }),
+                                           r => ({ status: 'rejected', reason: r }));
+
     try {
-        const [pamoRes, wasmRes] = await Promise.all([
-            runPython(opts),
-            runWasm(opts),
-        ]);
-        state.pamo  = pamoRes;
-        state.pamoC = wasmRes;
-        setInfo('pamo',   `${pamoRes.verts.length/3}v ${pamoRes.faces.length/3}f  ${fmtTime(pamoRes.ms)}`);
-        setInfo('pamo_c', `${wasmRes.verts.length/3}v ${wasmRes.faces.length/3}f  ${fmtTime(wasmRes.ms)}`);
-        recolour();
-        setStatus('ok', 'ok');
-    } catch (e) {
-        console.error(e);
-        setStatus(`error: ${e.message}`, 'error');
+        const [pyRes, wasmRes] = await Promise.all([pythonPromise, wasmPromise]);
+
+        // pamo_c
+        if (wasmRes.status === 'fulfilled') {
+            state.pamoC = wasmRes.value;
+            setInfo('pamo_c',
+                    `${wasmRes.value.verts.length/3}v `
+                  + `${wasmRes.value.faces.length/3}f  ${fmtTime(wasmRes.value.ms)}`);
+        } else {
+            state.pamoC = null;
+            setInfo('pamo_c', `error: ${wasmRes.reason.message}`);
+            console.error('[wasm]', wasmRes.reason);
+        }
+
+        // pamo (Python)
+        if (pyRes.status === 'fulfilled') {
+            state.pamo = pyRes.value;
+            setInfo('pamo',
+                    `${pyRes.value.verts.length/3}v `
+                  + `${pyRes.value.faces.length/3}f  ${fmtTime(pyRes.value.ms)}`);
+        } else {
+            state.pamo = null;
+            const msg = pyRes.reason && pyRes.reason.message ? pyRes.reason.message : String(pyRes.reason);
+            // If the server reports python unavailable, latch our state
+            // so subsequent runs skip it without retrying.
+            if (/unavailable|cuda|bad_alloc|cudaError/i.test(msg)) {
+                state.pythonAvailable = false;
+                state.pythonReason = msg;
+            }
+            setInfo('pamo', state.pythonAvailable === false
+                ? `unavailable — ${state.pythonReason}`
+                : `error: ${msg}`);
+            console.warn('[python]', msg);
+        }
+
+        // Display: only diff-colour when both produced output. Otherwise
+        // render whichever pipeline finished, alongside the input.
+        if (state.pamo && state.pamoC) {
+            recolour();
+        } else {
+            renderSinglePane();
+        }
+
+        // Status: ok if at least one finished, error only when both failed.
+        if (wasmRes.status === 'fulfilled' && pyRes.status === 'fulfilled') {
+            setStatus('ok', 'ok');
+        } else if (wasmRes.status === 'fulfilled') {
+            setStatus(state.pythonAvailable === false
+                ? 'pamo_c only (Python unavailable)' : 'pamo_c only', 'ok');
+        } else if (pyRes.status === 'fulfilled') {
+            setStatus('pamo only (pamo_c failed)', 'busy');
+        } else {
+            setStatus('both pipelines failed', 'error');
+        }
     } finally {
         ui.run.disabled = false;
     }
+}
+
+// Render whichever single output we have, plain (no diff colouring).
+function renderSinglePane() {
+    const wireframe = (ui.view.value === 'wireframe');
+    vps.input.setMesh(buildGeometry(state.inputMesh.verts.slice(),
+                                    state.inputMesh.faces.slice()),
+                      { wireframe });
+    if (state.pamo) {
+        vps.pamo.setMesh(buildGeometry(state.pamo.verts.slice(),
+                                       state.pamo.faces.slice()),
+                         { wireframe });
+    } else {
+        vps.pamo.setMesh(null);
+    }
+    if (state.pamoC) {
+        vps.pamo_c.setMesh(buildGeometry(state.pamoC.verts.slice(),
+                                         state.pamoC.faces.slice()),
+                           { wireframe });
+    } else {
+        vps.pamo_c.setMesh(null);
+    }
+    ui.metrics.textContent = '';
 }
 
 async function runPython(opts) {
@@ -449,4 +559,5 @@ function recolour() {
 
 // ── Bootstrap ────────────────────────────────────────────────────────
 
+probePython();
 fetchSamples();

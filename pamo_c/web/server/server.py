@@ -141,26 +141,60 @@ HMR_HUB: HmrHub | None = None
 
 
 # ── Lazy-loaded pamo runner (only when /process is hit) ──────────────
+#
+# pamo's full stack (torch, cumesh2sdf, pamo_safe_project) requires a CUDA
+# GPU. We try to import it lazily so the demo can still run with WASM-only
+# when CUDA / pamo isn't available; the failure mode (None payload, error
+# string) is exposed to the client via /health and /process.
 
-_pamo = None
+_pamo = None              # successful import payload
+_pamo_error = None        # cached failure message — None means "not yet tried"
+_pamo_tried = False
 
 def _get_pamo():
-    """Import the heavy pamo + torch stack once on first /process call."""
-    global _pamo
+    """Import the heavy pamo + torch stack on first call.
+    Returns a dict on success, raises RuntimeError on failure (cached)."""
+    global _pamo, _pamo_error, _pamo_tried
     if _pamo is not None:
         return _pamo
+    if _pamo_tried and _pamo_error is not None:
+        # Already known to be unavailable; don't retry on every request.
+        raise RuntimeError(_pamo_error)
+    _pamo_tried = True
     print("[server] loading pamo (torch + cumesh2sdf + pamo_safe_project)...",
           flush=True)
-    import numpy as np
-    import torch
-    import trimesh
-    import pamo as pamo_module
-    import pamo_safe_project.config as pamo_cfg
+    try:
+        import numpy as np
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("torch reports CUDA is not available")
+        import trimesh
+        import pamo as pamo_module
+        import pamo_safe_project.config as pamo_cfg
+    except Exception as e:
+        _pamo_error = f"{type(e).__name__}: {e}"
+        print(f"[server] pamo unavailable: {_pamo_error}", flush=True)
+        raise RuntimeError(_pamo_error) from e
     _pamo = {
         "np": np, "torch": torch, "trimesh": trimesh,
         "PaMO": pamo_module.PaMO, "Stage3Config": pamo_cfg.Stage3Config,
     }
     return _pamo
+
+
+def _pamo_health():
+    """Cheap, side-effect-free probe for /health. Returns
+    {available: bool, reason?: str}. First call may import the heavy
+    stack; subsequent calls return the cached verdict."""
+    if _pamo is not None:
+        return {"available": True}
+    if _pamo_tried and _pamo_error is not None:
+        return {"available": False, "reason": _pamo_error}
+    try:
+        _get_pamo()
+        return {"available": True}
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
 
 
 def _scaled_stage3_sizes(n_verts_in, n_faces_in, use_stage1, torch=None):
@@ -379,6 +413,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(_HMR_CLIENT_JS)
             return
+        if path == "/health":
+            return self._send_json(200, _pamo_health())
         if path == "/samples":
             samples = sorted(p.name for p in MESH_DIR.glob("*.obj"))
             return self._send_json(200, {"samples": samples})
@@ -399,6 +435,14 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0 or length > 256 * 1024 * 1024:
             return self._send_json(413, {"error": "bad payload size"})
+
+        # If the pamo stack is known-unavailable, short-circuit with 503
+        # rather than retrying the failing import on every request.
+        if _pamo is None and _pamo_tried and _pamo_error is not None:
+            return self._send_json(503, {
+                "error": _pamo_error, "available": False,
+            })
+
         try:
             body = self.rfile.read(length)
             req = json.loads(body)
@@ -417,6 +461,13 @@ class Handler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             import traceback; traceback.print_exc()
+            # Differentiate "pamo unavailable" (503) from a per-request
+            # runtime failure (500). The first call to run_python_pamo
+            # imports the stack and stamps _pamo_error on failure.
+            if _pamo is None and _pamo_error is not None:
+                return self._send_json(503, {
+                    "error": _pamo_error, "available": False,
+                })
             return self._send_json(500, {"error": str(e)})
 
 

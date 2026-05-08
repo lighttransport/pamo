@@ -24,6 +24,7 @@ pamo_simplify_opts pamo_simplify_opts_default(void) {
         .skinny_penalty_weight   = 5.0,
         .cost_range              = 10.0,
         .check_self_intersection = false,
+        .preserve_boundary       = true,
     };
 }
 
@@ -508,11 +509,44 @@ cleanup:
 
 /* ── Main simplification driver ──────────────────────────────────── */
 
+/* Rebuild the boundary-vertex lock array sized for the current
+ * mesh->n_verts. Caller must free with PAMO_FREE_ARRAY using the same n.
+ * Returns NULL on allocation failure. */
+static bool *build_boundary_lock(pamo_mesh *mesh) {
+    if (pamo_mesh_build_adjacency(mesh) != PAMO_OK) return NULL;
+    bool *vl = PAMO_ALLOC_ARRAY(&mesh->alloc, bool, mesh->n_verts);
+    if (!vl) { pamo_mesh_free_adjacency(mesh); return NULL; }
+    for (size_t i = 0; i < mesh->n_verts; i++) vl[i] = false;
+    for (size_t ei = 0; ei < mesh->n_edges; ei++) {
+        int32_t s = mesh->edge_face_offset[ei];
+        int32_t e = mesh->edge_face_offset[ei + 1];
+        if (e - s == 1) {
+            vl[mesh->edges[ei].u] = true;
+            vl[mesh->edges[ei].v] = true;
+        }
+    }
+    pamo_mesh_free_adjacency(mesh);
+    return vl;
+}
+
 pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
     if (!mesh || !opts) return PAMO_ERR_INVALID_ARG;
 
     int32_t stuck_counter = 0;
     double cost_limit = opts->cost_range;
+
+    /* If preserve_boundary, lock every vertex that touches a boundary edge
+     * (an edge with only one incident face). Without this, the simplifier
+     * eats inward from cracks/seams in non-watertight inputs and visibly
+     * widens them. The lock array is rebuilt each iteration because
+     * pamo_mesh_compact() renumbers vertex IDs. */
+    bool *vert_locked = NULL;
+    size_t vert_locked_n = 0;
+    if (opts->preserve_boundary) {
+        vert_locked = build_boundary_lock(mesh);
+        if (!vert_locked) return PAMO_ERR_ALLOC;
+        vert_locked_n = mesh->n_verts;
+    }
 
     for (int32_t iter = 0; iter < opts->max_iters; iter++) {
         size_t alive_faces = pamo_mesh_count_alive_faces(mesh);
@@ -521,12 +555,29 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
         size_t n_collapsed = 0;
         bool relax = (stuck_counter >= 2); /* relax normals when deeply stuck */
-        pamo_error err = simplify_round(mesh, opts, NULL,
+        pamo_error err = simplify_round(mesh, opts, vert_locked,
                                         cost_limit, relax, &n_collapsed);
-        if (err != PAMO_OK) return err;
+        if (err != PAMO_OK) {
+            if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
+                                             bool, vert_locked_n);
+            return err;
+        }
 
         err = pamo_mesh_compact(mesh);
-        if (err != PAMO_OK) return err;
+        if (err != PAMO_OK) {
+            if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
+                                             bool, vert_locked_n);
+            return err;
+        }
+
+        /* compact() renumbered vertices, so rebuild the lock array. */
+        if (opts->preserve_boundary) {
+            if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
+                                             bool, vert_locked_n);
+            vert_locked = build_boundary_lock(mesh);
+            if (!vert_locked) return PAMO_ERR_ALLOC;
+            vert_locked_n = mesh->n_verts;
+        }
 
         size_t new_alive = pamo_mesh_count_alive_faces(mesh);
 
@@ -540,6 +591,9 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
         if (stuck_counter >= opts->tolerance) break;
     }
+
+    if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
+                                     bool, vert_locked_n);
 
     /* ── Post-process: remove T-junction non-manifold vertices ────── */
     /* Only run this cleanup for non-watertight input meshes.

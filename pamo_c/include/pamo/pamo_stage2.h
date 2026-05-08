@@ -23,6 +23,11 @@ typedef struct {
     double  skinny_penalty_weight;  /* weight for skinny cost term (default 5.0) */
     double  cost_range;             /* cost clamp range (default 10.0) */
     bool    check_self_intersection; /* enable self-intersection rollback (default true) */
+    bool    preserve_boundary;       /* lock vertices on mesh boundary edges
+                                       (an edge with only 1 incident face) so
+                                       cracks/seams in the input are not
+                                       widened by collapses near them.
+                                       Default: true. */
 } pamo_simplify_opts;
 
 pamo_simplify_opts pamo_simplify_opts_default(void);

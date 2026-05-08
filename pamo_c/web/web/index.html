@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pamo vs pamo_c — interactive demo</title>
+<link rel="stylesheet" href="/web/styles.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.166.1/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.166.1/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<header>
+  <h1>pamo vs pamo_c</h1>
+  <div class="controls">
+    <label>Mesh
+      <select id="mesh-select"></select>
+    </label>
+    <label>Upload
+      <input type="file" id="mesh-upload" accept=".obj" />
+    </label>
+    <label>Ratio
+      <input type="range" id="ratio" min="-3" max="0" step="0.05" value="-1" />
+      <span id="ratio-val">0.100</span>
+    </label>
+    <label class="check"><input type="checkbox" id="stage1" /> Stage 1 (remesh)</label>
+    <label>SDF R (pamo_c)
+      <select id="sdf-r" title="Stage 1 voxel grid resolution. Auto matches Python (256/128/64 by target).">
+        <option value="0" selected>Auto</option>
+        <option value="64">64 (fast)</option>
+        <option value="128">128</option>
+        <option value="256">256 (slow)</option>
+      </select>
+    </label>
+    <label class="check"><input type="checkbox" id="stage3" /> Stage 3 (SAFE projection)</label>
+    <label>Diff scale (% of diameter)
+      <input type="range" id="cscale" min="0.5" max="20" step="0.5" value="5" />
+      <span id="cscale-val">5.0%</span>
+    </label>
+    <label>View
+      <select id="view-mode">
+        <option value="plain">Plain</option>
+        <option value="diff-input" selected>Diff vs input</option>
+        <option value="diff-other">Diff vs other port</option>
+        <option value="wireframe">Wireframe</option>
+      </select>
+    </label>
+    <button id="run">Apply</button>
+    <span id="status" class="status">idle</span>
+  </div>
+</header>
+
+<main id="viewports">
+  <section class="viewport" data-name="input">
+    <header><span class="title">input</span><span class="info"></span></header>
+    <div class="canvas-wrap"></div>
+  </section>
+  <section class="viewport" data-name="pamo">
+    <header><span class="title">pamo (Python / GPU)</span><span class="info"></span></header>
+    <div class="canvas-wrap"></div>
+  </section>
+  <section class="viewport" data-name="pamo_c">
+    <header><span class="title">pamo_c (WASM / CPU)</span><span class="info"></span></header>
+    <div class="canvas-wrap"></div>
+  </section>
+</main>
+
+<footer>
+  <div id="legend">
+    <span>colour ramp:</span>
+    <span class="swatch swatch-blue"></span>
+    <span>0</span>
+    <span class="ramp"></span>
+    <span id="legend-mid">2.5%</span>
+    <span class="ramp ramp-red"></span>
+    <span class="swatch swatch-red"></span>
+    <span id="legend-max">5%</span>
+    <span>(per-vertex distance to reference, normalised by input diameter)</span>
+  </div>
+  <div id="metrics"></div>
+</footer>
+
+<script type="module" src="/web/app.mjs"></script>
+</body>
+</html>

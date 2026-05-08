@@ -1,0 +1,10 @@
+{
+  "name": "pamo-web-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Compare original Python pamo and pamo_c (WASM) on a single OBJ.",
+  "bin": {
+    "pamo-compare": "./compare.mjs"
+  }
+}

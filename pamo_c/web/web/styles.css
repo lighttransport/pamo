@@ -1,0 +1,196 @@
+/* Copyright 2024 Light Transport Entertainment Inc.
+   SPDX-License-Identifier: Apache-2.0 */
+
+:root {
+  --bg:        #0e1116;
+  --panel:    #161b22;
+  --border:   #2a313c;
+  --text:     #d6deeb;
+  --muted:    #8a98ad;
+  --accent:   #61afef;
+  --warn:     #f0a76e;
+  --ok:       #98c379;
+  --err:      #e06c75;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+}
+
+body {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+}
+
+header {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 12px;
+}
+
+header h1 {
+  margin: 0 0 6px 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+}
+
+.controls label.check {
+  cursor: pointer;
+  user-select: none;
+}
+
+.controls input[type="range"] {
+  vertical-align: middle;
+  width: 140px;
+}
+
+.controls select, .controls input[type="file"] {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+.controls button {
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.controls button:disabled {
+  background: var(--border);
+  color: var(--muted);
+  cursor: progress;
+}
+
+.status {
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  background: var(--bg);
+}
+.status.busy   { color: var(--warn); }
+.status.ok     { color: var(--ok); }
+.status.error  { color: var(--err); }
+
+#viewports {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.viewport {
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.viewport > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.viewport .title {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.viewport .info {
+  font-family: ui-monospace, monospace;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.canvas-wrap {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+}
+
+.canvas-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+footer {
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  padding: 6px 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+#legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+.swatch-blue { background: rgb(0, 0, 255); }
+.swatch-red  { background: rgb(255, 0, 0); }
+
+.ramp {
+  display: inline-block;
+  width: 60px; height: 8px;
+  background: linear-gradient(to right, rgb(0,0,255), rgb(255,255,255));
+  border-radius: 2px;
+}
+.ramp-red {
+  background: linear-gradient(to right, rgb(255,255,255), rgb(255,0,0));
+}
+
+#metrics {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}

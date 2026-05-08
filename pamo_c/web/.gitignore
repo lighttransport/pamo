@@ -1,0 +1,13 @@
+# WASM build outputs and intermediate cmake tree
+wasm/build/
+wasm/pamo.mjs
+wasm/pamo.wasm
+
+# Node
+cli/node_modules/
+
+# CLI run outputs
+cli/out/
+
+# Python bytecode
+server/__pycache__/

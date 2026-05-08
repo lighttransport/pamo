@@ -74,12 +74,16 @@ export function serialise({ verts, faces, colors = null }) {
 // remaps faces onto a single ID per position before downstream
 // processing.
 //
-// `epsRel` is a fraction of the mesh diameter (default 1e-6, ≈ float32
-// precision); positions hashed into the same bucket are merged.
+// `epsRel` is a fraction of the mesh diameter (default 1e-4, ≈ a
+// modeller's typical snap tolerance — 0.01% of diameter, so ~34 µm
+// on a 0.3-unit mesh). Positions hashed into the same bucket are
+// merged. 1e-6 is too tight: it only catches float32-noise dupes,
+// not the slightly-off near-duplicates real modelling tools leave
+// behind, so cracks still appear at simplification time.
 //
 // Returns { verts, faces, merged }: a new vert/face pair with the
 // duplicates removed, plus the count of merged vertices for logging.
-export function weldVertices(verts, faces, epsRel = 1e-6) {
+export function weldVertices(verts, faces, epsRel = 1e-4) {
     const n = verts.length / 3;
     if (n === 0) return { verts, faces, merged: 0 };
     const { diameter } = bounds(verts);

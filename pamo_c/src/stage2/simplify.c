@@ -27,6 +27,7 @@ pamo_simplify_opts pamo_simplify_opts_default(void) {
         .preserve_boundary       = true,
         .progress_cb             = NULL,
         .progress_user           = NULL,
+        .surface_attract_weight  = 0.5,
     };
     return o;
 }
@@ -456,6 +457,8 @@ static pamo_error simplify_round(pamo_mesh *m,
                                  const pamo_simplify_opts *opts,
                                  const bool *vert_locked,
                                  pamo_quadric *Q,
+                                 const pamo_mesh *attract_mesh,
+                                 const pamo_bvh  *attract_bvh,
                                  double cost_limit,
                                  bool relax_normals,
                                  size_t *n_collapsed_out) {
@@ -616,6 +619,21 @@ static pamo_error simplify_round(pamo_mesh *m,
         pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
         pamo_vec3d mid = choose_placement(&Qsum, m->verts[u],
                                           m->verts[v], scale);
+        /* Input-surface attraction: blend the QEM placement toward the
+         * nearest point on the *original* input surface. Cheap to do
+         * per applied-collapse (one BVH query) but counter-acts the
+         * cumulative drift that propagated quadrics still leave on
+         * highly-textured regions (BirdHouse foundation/base). */
+        if (attract_bvh && attract_mesh && opts->surface_attract_weight > 0.0) {
+            pamo_nearest_result nr;
+            if (pamo_bvh_nearest(attract_bvh, attract_mesh, mid, &nr) == PAMO_OK) {
+                double w = opts->surface_attract_weight;
+                if (w > 1.0) w = 1.0;
+                mid.x = mid.x + w * (nr.point.x - mid.x);
+                mid.y = mid.y + w * (nr.point.y - mid.y);
+                mid.z = mid.z + w * (nr.point.z - mid.z);
+            }
+        }
         if (opts->check_self_intersection &&
             collapse_self_intersects(m, u, v, mid)) {
             continue;   /* would tear the mesh; skip this collapse */
@@ -697,6 +715,35 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
     }
     compute_quadrics(mesh, Q);
 
+    /* Snapshot the input mesh and build a triangle-BVH over it for
+     * the surface-attraction step. Cheaper than rebuilding per round
+     * (one build, then one nearest query per applied collapse). The
+     * BVH and snapshot are owned by this function and freed below. */
+    pamo_mesh attract_mesh = (pamo_mesh){0};
+    pamo_bvh  attract_bvh  = (pamo_bvh){0};
+    bool      attract_ok   = false;
+    if (opts->surface_attract_weight > 0.0) {
+        if (pamo_mesh_create(&attract_mesh, mesh->n_verts,
+                             mesh->n_faces, &mesh->alloc) == PAMO_OK) {
+            for (size_t i = 0; i < mesh->n_verts; i++)
+                attract_mesh.verts[i] = mesh->verts[i];
+            for (size_t i = 0; i < mesh->n_faces; i++) {
+                attract_mesh.faces[i] = mesh->faces[i];
+                attract_mesh.face_alive[i] = mesh->face_alive[i];
+            }
+            for (size_t i = 0; i < mesh->n_verts; i++)
+                attract_mesh.vert_alive[i] = mesh->vert_alive[i];
+            if (pamo_bvh_build_triangles(&attract_bvh, &attract_mesh,
+                                         &mesh->alloc) == PAMO_OK) {
+                attract_ok = true;
+            } else {
+                pamo_mesh_destroy(&attract_mesh);
+            }
+        }
+        /* Attraction is best-effort; fall through with weight=0
+         * effectively if the snapshot/BVH failed. */
+    }
+
     for (int32_t iter = 0; iter < opts->max_iters; iter++) {
         size_t alive_faces = pamo_mesh_count_alive_faces(mesh);
         if ((int32_t)alive_faces <= opts->target_faces) break;
@@ -705,11 +752,17 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
         size_t n_collapsed = 0;
         bool relax = (stuck_counter >= 2); /* relax normals when deeply stuck */
         pamo_error err = simplify_round(mesh, opts, vert_locked, Q,
+                                        attract_ok ? &attract_mesh : NULL,
+                                        attract_ok ? &attract_bvh  : NULL,
                                         cost_limit, relax, &n_collapsed);
         if (err != PAMO_OK) {
             if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
                                              bool, vert_locked_n);
             PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
+            if (attract_ok) {
+                pamo_bvh_destroy(&attract_bvh);
+                pamo_mesh_destroy(&attract_mesh);
+            }
             return err;
         }
 
@@ -723,6 +776,10 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
             if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
                                              bool, vert_locked_n);
             PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
+            if (attract_ok) {
+                pamo_bvh_destroy(&attract_bvh);
+                pamo_mesh_destroy(&attract_mesh);
+            }
             return PAMO_ERR_ALLOC;
         }
         err = pamo_mesh_compact_with_remap(mesh, vmap);
@@ -731,6 +788,10 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
             if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
                                              bool, vert_locked_n);
             PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
+            if (attract_ok) {
+                pamo_bvh_destroy(&attract_bvh);
+                pamo_mesh_destroy(&attract_mesh);
+            }
             return err;
         }
         for (size_t i = 0; i < pre_compact_nv; i++) {
@@ -748,6 +809,10 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
             vert_locked = build_boundary_lock(mesh);
             if (!vert_locked) {
                 PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
+                if (attract_ok) {
+                    pamo_bvh_destroy(&attract_bvh);
+                    pamo_mesh_destroy(&attract_mesh);
+                }
                 return PAMO_ERR_ALLOC;
             }
             vert_locked_n = mesh->n_verts;
@@ -782,6 +847,10 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
     if (vert_locked) PAMO_FREE_ARRAY(&mesh->alloc, vert_locked,
                                      bool, vert_locked_n);
     PAMO_FREE_ARRAY(&mesh->alloc, Q, pamo_quadric, Q_cap);
+    if (attract_ok) {
+        pamo_bvh_destroy(&attract_bvh);
+        pamo_mesh_destroy(&attract_mesh);
+    }
 
     /* ── Post-process: remove T-junction non-manifold vertices ────── */
     /* Only run this cleanup for non-watertight input meshes.

@@ -40,6 +40,15 @@ typedef struct {
                                        Default: true. */
     pamo_simplify_progress_cb progress_cb;  /* optional, NULL by default */
     void   *progress_user;                  /* opaque pointer passed to cb */
+
+    double  surface_attract_weight;  /* 0..1: blend collapse target toward
+                                        the nearest point on the *original*
+                                        input surface (built into a BVH
+                                        snapshot at simplify-entry). 0 =
+                                        pure QEM placement; ~0.5 cancels
+                                        accumulated drift on heavily
+                                        textured regions; 1 = pure
+                                        projection. Default: 0.5. */
 } pamo_simplify_opts;
 
 pamo_simplify_opts pamo_simplify_opts_default(void);

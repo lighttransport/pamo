@@ -127,11 +127,17 @@ static inline double pamo_quadric_eval(const pamo_quadric *q,
 
 /* Solve for the QEM-optimal placement v* that minimises v^T Q v.
  *   A v* = -b, where A = top-left 3x3 of Q, b = (m[3], m[6], m[8]).
- * Returns true on success (det(A) >= det_eps * scale^3); false if A is
- * (near-)singular and the caller should fall back to e.g. midpoint.
- * On success, *out is the optimal point. */
+ * Returns true on success; false if A is (near-)singular (e.g. on
+ * planar regions where Q is rank-1) and the caller should fall back
+ * to e.g. midpoint.
+ *
+ * `cond_eps` is a unit-less conditioning threshold: |det(A)| must be
+ * >= cond_eps * trace(A)^3 / 27. The trace^3 normalisation makes the
+ * test scale-invariant under area-weighted quadrics, so a flat panel
+ * (rank-1 A, det=0, finite trace) fails uniformly regardless of how
+ * many faces feed into it. 1e-9 is a reasonable default. */
 static inline bool pamo_quadric_optimal(const pamo_quadric *q,
-                                        double det_eps,
+                                        double cond_eps,
                                         pamo_vec3d *out) {
     /* A is symmetric: |A00 A01 A02; A01 A11 A12; A02 A12 A22|. */
     double a00 = q->m[0], a01 = q->m[1], a02 = q->m[2];
@@ -143,9 +149,17 @@ static inline bool pamo_quadric_optimal(const pamo_quadric *q,
     double c01 = a02*a12 - a01*a22;
     double c02 = a01*a12 - a02*a11;
     double det = a00*c00 + a01*c01 + a02*c02;
-    /* Scale-aware singularity check: A's entries are O(1) for unit
-     * normals, so |det| < det_eps means the system is rank-deficient. */
-    if (det > -det_eps && det < det_eps) return false;
+
+    /* Scale-invariant conditioning test. trace/3 is the average
+     * eigenvalue; (trace/3)^3 is its cube. det/(trace/3)^3 = product
+     * of eigenvalues / mean-cubed; near-zero iff at least one
+     * eigenvalue is much smaller than the others (= near-singular). */
+    double trace = a00 + a11 + a22;
+    double mean = trace / 3.0;
+    double scale_cube = mean * mean * mean;
+    double abs_det = det < 0 ? -det : det;
+    if (scale_cube <= 0.0) return false;
+    if (abs_det < cond_eps * scale_cube) return false;
 
     double c11 = a00*a22 - a02*a02;
     double c12 = a01*a02 - a00*a12;

@@ -46,12 +46,21 @@ static void compute_quadrics(const pamo_mesh *m, pamo_quadric *Q) {
 
     for (size_t fi = 0; fi < m->n_faces; fi++) {
         if (!m->face_alive[fi]) continue;
+        /* pamo_face_normal returns the cross product (e1 × e2), whose
+         * magnitude is 2 * triangle_area. Use that directly to weight
+         * the plane-quadric by area, so larger faces dominate over
+         * scanner-noise-sized triangles. Without weighting, a flat
+         * panel made of one big triangle and many tiny noise triangles
+         * tilts the per-vertex quadric toward the noise planes and
+         * the simplifier preferentially keeps the noisy surface. */
         pamo_vec3d n = pamo_face_normal(m, (int32_t)fi);
         double len = sqrt(pamo_v3_length_sq(n));
         if (len < 1e-30) continue;
+        double area = 0.5 * len;
         n = pamo_v3_scale(n, 1.0 / len);
         double d = -pamo_v3_dot(n, m->verts[m->faces[fi].v[0]]);
         pamo_quadric qf = pamo_quadric_from_plane(n.x, n.y, n.z, d);
+        for (int j = 0; j < 10; j++) qf.m[j] *= area;
         for (int k = 0; k < 3; k++) {
             int32_t vi = m->faces[fi].v[k];
             Q[vi] = pamo_quadric_add(Q[vi], qf);
@@ -78,10 +87,11 @@ static pamo_vec3d choose_placement(const pamo_quadric *Qsum,
                                    double scale) {
     pamo_vec3d mid = pamo_v3_scale(pamo_v3_add(pu, pv), 0.5);
     pamo_vec3d opt;
-    /* det_eps scaled by typical-quadric magnitude. Quadrics are sums
-     * of plane-outer-products, so entries are O(num_incident_faces). */
-    double det_eps = 1e-12;
-    if (!pamo_quadric_optimal(Qsum, det_eps, &opt)) return mid;
+    /* cond_eps is unit-less (det/trace^3-normalised). 1e-9 catches
+     * rank-deficient A (planar region) without rejecting full-rank
+     * but small-area quadrics. */
+    double cond_eps = 1e-9;
+    if (!pamo_quadric_optimal(Qsum, cond_eps, &opt)) return mid;
 
     /* Bound v* to a few edge-lengths from the midpoint. Tightens
      * placement on degenerate quadrics where the linear solve still

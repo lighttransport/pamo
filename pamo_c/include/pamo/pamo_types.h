@@ -125,6 +125,39 @@ static inline double pamo_quadric_eval(const pamo_quadric *q,
          + q->m[9];
 }
 
+/* Solve for the QEM-optimal placement v* that minimises v^T Q v.
+ *   A v* = -b, where A = top-left 3x3 of Q, b = (m[3], m[6], m[8]).
+ * Returns true on success (det(A) >= det_eps * scale^3); false if A is
+ * (near-)singular and the caller should fall back to e.g. midpoint.
+ * On success, *out is the optimal point. */
+static inline bool pamo_quadric_optimal(const pamo_quadric *q,
+                                        double det_eps,
+                                        pamo_vec3d *out) {
+    /* A is symmetric: |A00 A01 A02; A01 A11 A12; A02 A12 A22|. */
+    double a00 = q->m[0], a01 = q->m[1], a02 = q->m[2];
+    double a11 = q->m[4], a12 = q->m[5];
+    double a22 = q->m[7];
+    double b0  = q->m[3], b1  = q->m[6], b2  = q->m[8];
+
+    double c00 = a11*a22 - a12*a12;
+    double c01 = a02*a12 - a01*a22;
+    double c02 = a01*a12 - a02*a11;
+    double det = a00*c00 + a01*c01 + a02*c02;
+    /* Scale-aware singularity check: A's entries are O(1) for unit
+     * normals, so |det| < det_eps means the system is rank-deficient. */
+    if (det > -det_eps && det < det_eps) return false;
+
+    double c11 = a00*a22 - a02*a02;
+    double c12 = a01*a02 - a00*a12;
+    double c22 = a00*a11 - a01*a01;
+    double inv = 1.0 / det;
+    /* v* = -A^-1 b. */
+    out->x = -inv * (c00*b0 + c01*b1 + c02*b2);
+    out->y = -inv * (c01*b0 + c11*b1 + c12*b2);
+    out->z = -inv * (c02*b0 + c12*b1 + c22*b2);
+    return true;
+}
+
 /* ── Debug assertion macro ───────────────────────────────────────── */
 
 #ifndef NDEBUG

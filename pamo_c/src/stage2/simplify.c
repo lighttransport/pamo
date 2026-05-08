@@ -63,6 +63,36 @@ static void compute_quadrics(const pamo_mesh *m, pamo_quadric *Q) {
 
 static const double COST_INF = 1e20;
 
+/* Pick the collapse target position. Standard QEM (Garland-Heckbert)
+ * solves A v* = -b from the summed quadric and lands close to the input
+ * surface. Falling back to the chord midpoint biases collapses inward
+ * on curved/noisy regions and produces the low-frequency 'wobble' we
+ * see on real scans. We use optimal placement when:
+ *   1. the system is non-singular (det >= det_eps), and
+ *   2. v* is within max_offset_ratio * edge_len of the midpoint.
+ * The second guard catches near-singular A's where the inverse blows
+ * up despite the determinant test, and prevents pathological collapses
+ * on thin sliver features from flinging verts across the model. */
+static pamo_vec3d choose_placement(const pamo_quadric *Qsum,
+                                   pamo_vec3d pu, pamo_vec3d pv,
+                                   double scale) {
+    pamo_vec3d mid = pamo_v3_scale(pamo_v3_add(pu, pv), 0.5);
+    pamo_vec3d opt;
+    /* det_eps scaled by typical-quadric magnitude. Quadrics are sums
+     * of plane-outer-products, so entries are O(num_incident_faces). */
+    double det_eps = 1e-12;
+    if (!pamo_quadric_optimal(Qsum, det_eps, &opt)) return mid;
+
+    /* Bound v* to a few edge-lengths from the midpoint. Tightens
+     * placement on degenerate quadrics where the linear solve still
+     * succeeds but yields a far-flung point. */
+    double edge_len = sqrt(pamo_v3_length_sq(pamo_v3_sub(pu, pv)));
+    double max_off  = 4.0 * (edge_len > scale ? edge_len : scale);
+    pamo_vec3d delta = pamo_v3_sub(opt, mid);
+    if (pamo_v3_length_sq(delta) > max_off * max_off) return mid;
+    return opt;
+}
+
 /* Check if collapsing endpoint→mid flips any adjacent normal or
  * creates a skinny triangle. Returns true if INVALID. */
 static bool collapse_creates_problem(const pamo_mesh *m,
@@ -210,7 +240,8 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
 
     pamo_vec3d pu = m->verts[u];
     pamo_vec3d pv = m->verts[v];
-    pamo_vec3d mid = pamo_v3_scale(pamo_v3_add(pu, pv), 0.5);
+    pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
+    pamo_vec3d mid = choose_placement(&Qsum, pu, pv, scale);
 
     /* Normal flip / skinny check for both endpoints. */
     if (collapse_creates_problem(m, u, v, mid, skinny_thresh, flip_threshold))
@@ -218,8 +249,7 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
     if (collapse_creates_problem(m, v, u, mid, skinny_thresh, flip_threshold))
         return COST_INF;
 
-    /* Quadric error at midpoint. */
-    pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
+    /* Quadric error at the chosen placement. */
     double qerr = pamo_quadric_eval(&Qsum, mid);
     if (qerr < 0.0) qerr = 0.0;
     double s2 = scale * scale;
@@ -493,8 +523,9 @@ static pamo_error simplify_round(pamo_mesh *m,
 
         if (!safe) continue;
 
-        pamo_vec3d mid = pamo_v3_scale(
-            pamo_v3_add(m->verts[u], m->verts[v]), 0.5);
+        pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
+        pamo_vec3d mid = choose_placement(&Qsum, m->verts[u],
+                                          m->verts[v], scale);
         apply_collapse(m, u, v, mid);
         actually_collapsed++;
     }

@@ -144,7 +144,14 @@ Start the server with the CUDA venv (so the `/process` endpoint can import
 ```sh
 # from the repo root
 .venv-cuda12/bin/python pamo_c/web/server/server.py
+# or, with Vite-style live reload on JS/HTML/CSS edits:
+.venv-cuda12/bin/python pamo_c/web/server/server.py --watch
 ```
+
+`--watch` polls `shared/` and `web/` for `.js`/`.mjs`/`.html`/`.css`
+changes and full-reloads any open tabs over an SSE channel
+(`/__hmr`). WASM rebuilds aren't watched (rerun `wasm/build.sh` and
+hit reload manually).
 
 Open <http://127.0.0.1:5050/>. Choose a sample (or upload an `.obj`),
 adjust the **ratio** slider and **stage 1 / stage 3** toggles, hit **Apply**

@@ -25,6 +25,7 @@ import json
 import mimetypes
 import os
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +39,105 @@ MESH_DIR = REPO_ROOT / "mesh"
 # Make sure .mjs files are served as JavaScript so browsers ESM-import them.
 mimetypes.add_type("application/javascript", ".mjs")
 mimetypes.add_type("application/wasm", ".wasm")
+
+
+# ── HMR (Vite-style live reload) ─────────────────────────────────────
+#
+# Opt-in via `--watch`. Polls the served static dirs for mtime changes and
+# fans the latest tick out to all SSE clients on /__hmr; the injected
+# client script does a full window.location.reload() on each tick.
+#
+# Polling rather than inotify keeps it stdlib-only and portable. Cost is
+# negligible (a few hundred stat() calls every 500 ms).
+
+_HMR_CLIENT_JS = b"""
+(() => {
+  if (window.__pamoHmrAttached) return;
+  window.__pamoHmrAttached = true;
+  let connected = false;
+  function connect() {
+    const es = new EventSource('/__hmr');
+    es.addEventListener('open', () => { connected = true; });
+    es.addEventListener('reload', () => {
+      console.log('[hmr] reload');
+      es.close();
+      window.location.reload();
+    });
+    es.addEventListener('error', () => {
+      es.close();
+      // Server gone -- retry every second so a restarted server picks
+      // up the same tab.
+      setTimeout(connect, 1000);
+    });
+  }
+  connect();
+})();
+"""
+
+_HMR_INJECT = (b"<script src=\"/__hmr_client.js\"></script>\n</body>")
+
+
+class HmrHub:
+    """Multi-subscriber pub/sub keyed on monotonic 'tick' counter."""
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._tick = 0
+
+    def bump(self):
+        with self._cv:
+            self._tick += 1
+            self._cv.notify_all()
+
+    def wait_for(self, last_seen, timeout):
+        """Block until tick > last_seen or timeout elapses. Returns the
+        current tick (which may equal last_seen on timeout)."""
+        with self._cv:
+            self._cv.wait_for(lambda: self._tick > last_seen, timeout=timeout)
+            return self._tick
+
+
+def _start_watcher(roots, hub: HmrHub, exts, interval=0.5):
+    """Background thread: scan `roots` for any file with a suffix in `exts`
+    and bump `hub` whenever the max mtime advances."""
+    def scan():
+        latest = 0.0
+        for root in roots:
+            if not root.exists():
+                continue
+            for p in root.rglob("*"):
+                if p.suffix.lower() not in exts:
+                    continue
+                try:
+                    m = p.stat().st_mtime
+                except OSError:
+                    continue
+                if m > latest:
+                    latest = m
+        return latest
+
+    last = scan()
+
+    def loop():
+        nonlocal last
+        while True:
+            time.sleep(interval)
+            try:
+                cur = scan()
+            except Exception:
+                continue
+            if cur > last:
+                last = cur
+                hub.bump()
+                print("[hmr] file change detected → notifying clients",
+                      flush=True)
+
+    t = threading.Thread(target=loop, name="pamo-hmr-watch", daemon=True)
+    t.start()
+
+
+# Globals populated by main() when --watch is set.
+HMR_ENABLED = False
+HMR_HUB: HmrHub | None = None
 
 
 # ── Lazy-loaded pamo runner (only when /process is hit) ──────────────
@@ -217,6 +317,10 @@ class Handler(BaseHTTPRequestHandler):
     def _send_file(self, path: Path):
         ctype, _ = mimetypes.guess_type(str(path))
         data = path.read_bytes()
+        # In --watch mode, inject the HMR client into served HTML so a
+        # tab opened on / picks up future file changes automatically.
+        if HMR_ENABLED and ctype == "text/html" and b"</body>" in data:
+            data = data.replace(b"</body>", _HMR_INJECT, 1)
         self.send_response(200)
         self.send_header("Content-Type", ctype or "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
@@ -226,8 +330,47 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_hmr_stream(self):
+        """SSE endpoint: hold the connection open and emit a `reload`
+        event whenever the watcher's tick advances."""
+        if not HMR_ENABLED or HMR_HUB is None:
+            return self._send_json(404, {"error": "hmr disabled"})
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            # Initial comment line flushes headers in some browsers.
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+            last = HMR_HUB._tick
+            while True:
+                cur = HMR_HUB.wait_for(last, timeout=15.0)
+                if cur > last:
+                    last = cur
+                    self.wfile.write(
+                        f"event: reload\ndata: {cur}\n\n".encode())
+                else:
+                    # Keep-alive ping so proxies / browsers don't time out.
+                    self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return  # client disconnected, normal
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        if path == "/__hmr":
+            return self._serve_hmr_stream()
+        if path == "/__hmr_client.js":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Content-Length", str(len(_HMR_CLIENT_JS)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(_HMR_CLIENT_JS)
+            return
         if path == "/samples":
             samples = sorted(p.name for p in MESH_DIR.glob("*.obj"))
             return self._send_json(200, {"samples": samples})
@@ -274,11 +417,26 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=5050)
+    p.add_argument("--watch", action="store_true",
+                   help="Vite-style live reload: poll JS/HTML/CSS in "
+                        "shared/ + web/ and auto-reload connected tabs.")
     args = p.parse_args()
 
     if not (WEB_ROOT / "wasm" / "pamo.mjs").exists():
         print("warning: wasm/pamo.mjs not found. Build it first:\n"
               "  cd pamo_c/web/wasm && ./build.sh", file=sys.stderr)
+
+    if args.watch:
+        global HMR_ENABLED, HMR_HUB
+        HMR_ENABLED = True
+        HMR_HUB = HmrHub()
+        _start_watcher(
+            roots=[WEB_ROOT / "shared", WEB_ROOT / "web"],
+            hub=HMR_HUB,
+            exts={".js", ".mjs", ".html", ".css"},
+        )
+        print("[hmr] watching shared/ + web/ for .js/.mjs/.html/.css "
+              "changes (full page reload on change)", flush=True)
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[server] http://{args.host}:{args.port}/   "

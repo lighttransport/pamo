@@ -252,10 +252,18 @@ def run_python_pamo(verts, faces, ratio, use_stage1, use_stage3):
     try:
         runner = PaMO(input_mesh, use_stage1=use_stage1, use_stage3=use_stage3)
         t0 = time.time()
+        # min_verts=0 forces Python's PaMO.run to honour `ratio` as
+        # `target_faces = int(ratio * n_input_faces)` — matching the
+        # pamo_c WASM wrapper. The library default is 1e10, which makes
+        # `target_faces` effectively unbounded so simplification stops
+        # only when its cost-threshold convergence trips, leaving the
+        # mesh barely reduced (e.g. 91% retained on BirdHouse). Passing
+        # 0 makes the comparison apples-to-apples.
         out_v, out_f = runner.run(
             torch.from_numpy(verts_np).float().cuda(),
             torch.from_numpy(faces_np).int().cuda(),
             ratio=ratio,
+            min_verts=0,
         )
         ms = (time.time() - t0) * 1000.0
     finally:

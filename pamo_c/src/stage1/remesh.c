@@ -6,6 +6,7 @@
  */
 #include "pamo/pamo_stage1.h"
 #include "pamo/pamo_bvh.h"
+#include "pamo/pamo_progress.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -55,6 +56,7 @@ pamo_error pamo_remesh(pamo_mesh *out, const pamo_mesh *in,
 
     fprintf(stderr, "Stage 1: R=%d, voxel=%.6f, grid_size=%.4f\n",
             R, voxel_size, 2.0 * half_size);
+    pamo_emit_progress("remesh_start", (int64_t)R, (int64_t)R);
 
     /* Build BVH for input mesh. */
     pamo_bvh bvh;
@@ -70,6 +72,7 @@ pamo_error pamo_remesh(pamo_mesh *out, const pamo_mesh *in,
     }
 
     /* Compute SDF. */
+    pamo_emit_progress("remesh_sdf", 0, (int64_t)R);
     err = pamo_compute_sdf(sdf, R, grid_origin, voxel_size, in, &bvh);
     pamo_bvh_destroy(&bvh);
     if (err != PAMO_OK) {
@@ -85,6 +88,7 @@ pamo_error pamo_remesh(pamo_mesh *out, const pamo_mesh *in,
     }
 
     /* Extract mesh via dual marching cubes at iso=0. */
+    pamo_emit_progress("remesh_dual_mc", 0, (int64_t)R);
     err = pamo_dual_mc(out, sdf, R, grid_origin, voxel_size, 0.0, alloc);
     pamo_free(alloc, sdf, grid_size * sizeof(double));
 

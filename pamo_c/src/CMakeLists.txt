@@ -3,6 +3,7 @@
 
 add_library(pamo STATIC
     alloc.c
+    progress.c
     sort.c
     tri_tri_intersect.c
     mesh/mesh.c

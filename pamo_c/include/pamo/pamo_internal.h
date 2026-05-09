@@ -9,6 +9,7 @@
 #define PAMO_INTERNAL_H
 
 #include "pamo_types.h"
+#include "pamo_mesh.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,22 @@ typedef struct {
 } pamo_edge_cost_entry;
 
 void pamo_sort_edge_costs(pamo_edge_cost_entry *arr, size_t n);
+
+/* ── Mesh growth helpers (defined in src/mesh/mesh.c) ─────────────
+ * Reserve a capacity ≥ n; double-and-grow with PAMO_REALLOC. Append
+ * helpers grow as needed, mark the new slot alive, and (for verts)
+ * return the new index via *out. */
+pamo_error pamo_mesh_reserve_verts(pamo_mesh *m, size_t n);
+pamo_error pamo_mesh_reserve_faces(pamo_mesh *m, size_t n);
+pamo_error pamo_mesh_append_vert(pamo_mesh *m, pamo_vec3d p, int32_t *out);
+pamo_error pamo_mesh_append_face(pamo_mesh *m,
+                                 int32_t a, int32_t b, int32_t c);
+
+/* ── Stage 2 post-process (defined in src/stage2/postprocess.c) ───
+ * Bowtie-vertex split + boundary-loop hole-fill. Run after the main
+ * simplification loop to make the output watertight + 2-manifold for
+ * collision use. Idempotent on already-clean meshes. */
+pamo_error pamo_simplify_postprocess(pamo_mesh *mesh);
 
 #ifdef __cplusplus
 }

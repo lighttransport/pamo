@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "pamo/pamo_mesh.h"
+#include "pamo/pamo_internal.h"
 
 #include <string.h>
 
@@ -80,6 +81,68 @@ size_t pamo_mesh_count_alive_verts(const pamo_mesh *m) {
         if (m->vert_alive[i]) count++;
     }
     return count;
+}
+
+/* ── Capacity-growing helpers (internal API) ─────────────────────── */
+
+pamo_error pamo_mesh_reserve_verts(pamo_mesh *m, size_t n) {
+    if (m->n_verts_cap >= n) return PAMO_OK;
+    size_t new_cap = m->n_verts_cap ? m->n_verts_cap : 16;
+    while (new_cap < n) new_cap *= 2;
+    pamo_vec3d *nv = (pamo_vec3d *)PAMO_REALLOC(
+        &m->alloc, m->verts,
+        m->n_verts_cap * sizeof(pamo_vec3d),
+        new_cap * sizeof(pamo_vec3d));
+    bool *na = (bool *)PAMO_REALLOC(
+        &m->alloc, m->vert_alive,
+        m->n_verts_cap * sizeof(bool),
+        new_cap * sizeof(bool));
+    if (!nv || !na) return PAMO_ERR_ALLOC;
+    m->verts = nv;
+    m->vert_alive = na;
+    m->n_verts_cap = new_cap;
+    return PAMO_OK;
+}
+
+pamo_error pamo_mesh_reserve_faces(pamo_mesh *m, size_t n) {
+    if (m->n_faces_cap >= n) return PAMO_OK;
+    size_t new_cap = m->n_faces_cap ? m->n_faces_cap : 16;
+    while (new_cap < n) new_cap *= 2;
+    pamo_tri *nf = (pamo_tri *)PAMO_REALLOC(
+        &m->alloc, m->faces,
+        m->n_faces_cap * sizeof(pamo_tri),
+        new_cap * sizeof(pamo_tri));
+    bool *nfa = (bool *)PAMO_REALLOC(
+        &m->alloc, m->face_alive,
+        m->n_faces_cap * sizeof(bool),
+        new_cap * sizeof(bool));
+    if (!nf || !nfa) return PAMO_ERR_ALLOC;
+    m->faces = nf;
+    m->face_alive = nfa;
+    m->n_faces_cap = new_cap;
+    return PAMO_OK;
+}
+
+pamo_error pamo_mesh_append_vert(pamo_mesh *m, pamo_vec3d p, int32_t *out) {
+    pamo_error e = pamo_mesh_reserve_verts(m, m->n_verts + 1);
+    if (e != PAMO_OK) return e;
+    int32_t i = (int32_t)m->n_verts++;
+    m->verts[i] = p;
+    m->vert_alive[i] = true;
+    if (out) *out = i;
+    return PAMO_OK;
+}
+
+pamo_error pamo_mesh_append_face(pamo_mesh *m,
+                                 int32_t a, int32_t b, int32_t c) {
+    pamo_error e = pamo_mesh_reserve_faces(m, m->n_faces + 1);
+    if (e != PAMO_OK) return e;
+    int32_t i = (int32_t)m->n_faces++;
+    m->faces[i].v[0] = a;
+    m->faces[i].v[1] = b;
+    m->faces[i].v[2] = c;
+    m->face_alive[i] = true;
+    return PAMO_OK;
 }
 
 pamo_aabb pamo_mesh_bounds(const pamo_mesh *m) {

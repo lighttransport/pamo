@@ -16,6 +16,7 @@ add_library(pamo STATIC
     stage1/dual_mc.c
     stage1/remesh.c
     stage2/simplify.c
+    stage2/postprocess.c
     stage3/spd_project.c
     stage3/cg_solver.c
     stage3/ccd.c

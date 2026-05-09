@@ -693,6 +693,68 @@ cleanup:
     return PAMO_OK;
 }
 
+/* ── Mesh-grow helpers (used by hole-fill / bowtie-split) ──────────── */
+
+static pamo_error mesh_reserve_verts(pamo_mesh *m, size_t n) {
+    if (m->n_verts_cap >= n) return PAMO_OK;
+    size_t new_cap = m->n_verts_cap ? m->n_verts_cap : 16;
+    while (new_cap < n) new_cap *= 2;
+    pamo_vec3d *nv = (pamo_vec3d *)PAMO_REALLOC(
+        &m->alloc, m->verts,
+        m->n_verts_cap * sizeof(pamo_vec3d),
+        new_cap * sizeof(pamo_vec3d));
+    bool *na = (bool *)PAMO_REALLOC(
+        &m->alloc, m->vert_alive,
+        m->n_verts_cap * sizeof(bool),
+        new_cap * sizeof(bool));
+    if (!nv || !na) return PAMO_ERR_ALLOC;
+    m->verts = nv;
+    m->vert_alive = na;
+    m->n_verts_cap = new_cap;
+    return PAMO_OK;
+}
+
+static pamo_error mesh_reserve_faces(pamo_mesh *m, size_t n) {
+    if (m->n_faces_cap >= n) return PAMO_OK;
+    size_t new_cap = m->n_faces_cap ? m->n_faces_cap : 16;
+    while (new_cap < n) new_cap *= 2;
+    pamo_tri *nf = (pamo_tri *)PAMO_REALLOC(
+        &m->alloc, m->faces,
+        m->n_faces_cap * sizeof(pamo_tri),
+        new_cap * sizeof(pamo_tri));
+    bool *nfa = (bool *)PAMO_REALLOC(
+        &m->alloc, m->face_alive,
+        m->n_faces_cap * sizeof(bool),
+        new_cap * sizeof(bool));
+    if (!nf || !nfa) return PAMO_ERR_ALLOC;
+    m->faces = nf;
+    m->face_alive = nfa;
+    m->n_faces_cap = new_cap;
+    return PAMO_OK;
+}
+
+static pamo_error mesh_append_vert(pamo_mesh *m, pamo_vec3d p, int32_t *out) {
+    pamo_error e = mesh_reserve_verts(m, m->n_verts + 1);
+    if (e != PAMO_OK) return e;
+    int32_t i = (int32_t)m->n_verts++;
+    m->verts[i] = p;
+    m->vert_alive[i] = true;
+    if (out) *out = i;
+    return PAMO_OK;
+}
+
+static pamo_error mesh_append_face(pamo_mesh *m,
+                                   int32_t a, int32_t b, int32_t c) {
+    pamo_error e = mesh_reserve_faces(m, m->n_faces + 1);
+    if (e != PAMO_OK) return e;
+    int32_t i = (int32_t)m->n_faces++;
+    m->faces[i].v[0] = a;
+    m->faces[i].v[1] = b;
+    m->faces[i].v[2] = c;
+    m->face_alive[i] = true;
+    return PAMO_OK;
+}
+
 /* ── Main simplification driver ──────────────────────────────────── */
 
 /* Rebuild the boundary-vertex lock array sized for the current
@@ -1129,80 +1191,109 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
             }
             if (!closed || L < 3) continue;
 
-            /* Centroid of loop verts (placement only, not error-aware
-             * — for collision the topology matters far more than the
-             * exact fill shape, and a centroid never falls outside a
-             * convex hole). */
-            pamo_vec3d c = {0, 0, 0};
-            for (size_t i = 0; i < L; i++) {
-                c.x += mesh->verts[loop[i]].x;
-                c.y += mesh->verts[loop[i]].y;
-                c.z += mesh->verts[loop[i]].z;
-            }
-            c.x /= (double)L; c.y /= (double)L; c.z /= (double)L;
+            pamo_error fill_err = PAMO_OK;
 
-            /* Append centroid vertex (grow as needed). */
-            if (mesh->n_verts >= mesh->n_verts_cap) {
-                size_t old_cap = mesh->n_verts_cap;
-                size_t new_cap = old_cap ? old_cap * 2 : 16;
-                pamo_vec3d *nv = (pamo_vec3d *)PAMO_REALLOC(
-                    &mesh->alloc, mesh->verts,
-                    old_cap * sizeof(pamo_vec3d),
-                    new_cap * sizeof(pamo_vec3d));
-                bool *na = (bool *)PAMO_REALLOC(
-                    &mesh->alloc, mesh->vert_alive,
-                    old_cap * sizeof(bool),
-                    new_cap * sizeof(bool));
-                if (!nv || !na) {
-                    PAMO_FREE_ARRAY(&mesh->alloc, loop, int32_t, n_bdy);
-                    PAMO_FREE_ARRAY(&mesh->alloc, be_from, int32_t, n_bdy);
-                    PAMO_FREE_ARRAY(&mesh->alloc, be_to,   int32_t, n_bdy);
-                    PAMO_FREE_ARRAY(&mesh->alloc, be_used, bool,    n_bdy);
-                    return PAMO_ERR_ALLOC;
+            /* Min-area DP triangulation for small/medium loops. The
+             * centroid fan that was here before introduced a spike
+             * vertex per loop and tiled long thin cracks with a star
+             * pattern; the DP picks the in-loop triangulation with
+             * minimum total area, producing a balanced fill that
+             * matches the surrounding surface. O(L^3) — capped at
+             * L_DP_MAX so a pathological large loop falls back to the
+             * fan rather than blowing up. */
+            const size_t L_DP_MAX = 96;
+            if (L <= L_DP_MAX) {
+                double *T = PAMO_ALLOC_ARRAY(&mesh->alloc, double, L * L);
+                int32_t *K = PAMO_ALLOC_ARRAY(&mesh->alloc, int32_t, L * L);
+                if (!T || !K) {
+                    if (T) PAMO_FREE_ARRAY(&mesh->alloc, T, double, L * L);
+                    if (K) PAMO_FREE_ARRAY(&mesh->alloc, K, int32_t, L * L);
+                    fill_err = PAMO_ERR_ALLOC;
+                    goto holefill_cleanup;
                 }
-                mesh->verts = nv;
-                mesh->vert_alive = na;
-                mesh->n_verts_cap = new_cap;
-            }
-            int32_t cv = (int32_t)mesh->n_verts++;
-            mesh->verts[cv] = c;
-            mesh->vert_alive[cv] = true;
-
-            /* Fan-triangulate. The boundary half-edge (a→b) lives in
-             * exactly one face whose third vertex is on the SURFACE
-             * side; the fill triangle (cv, b, a) — reversed winding
-             * — therefore faces outward. */
-            for (size_t i = 0; i < L; i++) {
-                int32_t a = loop[i];
-                int32_t b = loop[(i + 1) % L];
-                if (mesh->n_faces >= mesh->n_faces_cap) {
-                    size_t old_cap = mesh->n_faces_cap;
-                    size_t new_cap = old_cap ? old_cap * 2 : 16;
-                    pamo_tri *nf = (pamo_tri *)PAMO_REALLOC(
-                        &mesh->alloc, mesh->faces,
-                        old_cap * sizeof(pamo_tri),
-                        new_cap * sizeof(pamo_tri));
-                    bool *nfa = (bool *)PAMO_REALLOC(
-                        &mesh->alloc, mesh->face_alive,
-                        old_cap * sizeof(bool),
-                        new_cap * sizeof(bool));
-                    if (!nf || !nfa) {
-                        PAMO_FREE_ARRAY(&mesh->alloc, loop, int32_t, n_bdy);
-                        PAMO_FREE_ARRAY(&mesh->alloc, be_from, int32_t, n_bdy);
-                        PAMO_FREE_ARRAY(&mesh->alloc, be_to,   int32_t, n_bdy);
-                        PAMO_FREE_ARRAY(&mesh->alloc, be_used, bool,    n_bdy);
-                        return PAMO_ERR_ALLOC;
+                for (size_t i = 0; i < L * L; i++) { T[i] = 0.0; K[i] = -1; }
+                for (size_t span = 2; span < L; span++) {
+                    for (size_t i = 0; i + span < L; i++) {
+                        size_t j = i + span;
+                        double best = 1e300;
+                        int32_t best_k = -1;
+                        for (size_t k = i + 1; k < j; k++) {
+                            pamo_vec3d a = mesh->verts[loop[i]];
+                            pamo_vec3d b = mesh->verts[loop[k]];
+                            pamo_vec3d c2 = mesh->verts[loop[j]];
+                            pamo_vec3d cr = pamo_v3_cross(
+                                pamo_v3_sub(b, a), pamo_v3_sub(c2, a));
+                            double area = 0.5 * sqrt(pamo_v3_length_sq(cr));
+                            double cand = T[i * L + k] + T[k * L + j] + area;
+                            if (cand < best) { best = cand; best_k = (int32_t)k; }
+                        }
+                        T[i * L + j] = best;
+                        K[i * L + j] = best_k;
                     }
-                    mesh->faces = nf;
-                    mesh->face_alive = nfa;
-                    mesh->n_faces_cap = new_cap;
                 }
-                int32_t fi = (int32_t)mesh->n_faces++;
-                mesh->faces[fi].v[0] = cv;
-                mesh->faces[fi].v[1] = b;
-                mesh->faces[fi].v[2] = a;
-                mesh->face_alive[fi] = true;
+                /* Reconstruct via stack: emit triangle (l[j], l[k], l[i])
+                 * for each split. That winding is the reverse of the
+                 * boundary-loop direction, which makes each fill triangle
+                 * face outward (same convention as the fan path). */
+                int32_t *stk = PAMO_ALLOC_ARRAY(&mesh->alloc, int32_t, 2 * L);
+                if (!stk) {
+                    PAMO_FREE_ARRAY(&mesh->alloc, T, double, L * L);
+                    PAMO_FREE_ARRAY(&mesh->alloc, K, int32_t, L * L);
+                    fill_err = PAMO_ERR_ALLOC;
+                    goto holefill_cleanup;
+                }
+                size_t sp = 0;
+                stk[sp++] = 0;
+                stk[sp++] = (int32_t)L - 1;
+                while (sp > 0) {
+                    int32_t j = stk[--sp];
+                    int32_t i = stk[--sp];
+                    if (j - i < 2) continue;
+                    int32_t k = K[(size_t)i * L + (size_t)j];
+                    if (k < 0) continue;
+                    pamo_error ae = mesh_append_face(mesh,
+                        loop[(size_t)j], loop[(size_t)k], loop[(size_t)i]);
+                    if (ae != PAMO_OK) {
+                        PAMO_FREE_ARRAY(&mesh->alloc, stk, int32_t, 2 * L);
+                        PAMO_FREE_ARRAY(&mesh->alloc, T, double, L * L);
+                        PAMO_FREE_ARRAY(&mesh->alloc, K, int32_t, L * L);
+                        fill_err = ae;
+                        goto holefill_cleanup;
+                    }
+                    stk[sp++] = i; stk[sp++] = k;
+                    stk[sp++] = k; stk[sp++] = j;
+                }
+                PAMO_FREE_ARRAY(&mesh->alloc, stk, int32_t, 2 * L);
+                PAMO_FREE_ARRAY(&mesh->alloc, T, double, L * L);
+                PAMO_FREE_ARRAY(&mesh->alloc, K, int32_t, L * L);
+            } else {
+                /* Centroid-fan fallback: simple but always works. Used
+                 * for very long loops where O(L^3) DP is impractical. */
+                pamo_vec3d cc = {0, 0, 0};
+                for (size_t i = 0; i < L; i++) {
+                    cc.x += mesh->verts[loop[i]].x;
+                    cc.y += mesh->verts[loop[i]].y;
+                    cc.z += mesh->verts[loop[i]].z;
+                }
+                cc.x /= (double)L; cc.y /= (double)L; cc.z /= (double)L;
+                int32_t cv = -1;
+                fill_err = mesh_append_vert(mesh, cc, &cv);
+                if (fill_err != PAMO_OK) goto holefill_cleanup;
+                for (size_t i = 0; i < L && fill_err == PAMO_OK; i++) {
+                    int32_t a = loop[i];
+                    int32_t b = loop[(i + 1) % L];
+                    fill_err = mesh_append_face(mesh, cv, b, a);
+                }
+                if (fill_err != PAMO_OK) goto holefill_cleanup;
             }
+            continue;
+
+        holefill_cleanup:
+            PAMO_FREE_ARRAY(&mesh->alloc, loop, int32_t, n_bdy);
+            PAMO_FREE_ARRAY(&mesh->alloc, be_from, int32_t, n_bdy);
+            PAMO_FREE_ARRAY(&mesh->alloc, be_to,   int32_t, n_bdy);
+            PAMO_FREE_ARRAY(&mesh->alloc, be_used, bool,    n_bdy);
+            return fill_err;
         }
 
         PAMO_FREE_ARRAY(&mesh->alloc, loop, int32_t, n_bdy);

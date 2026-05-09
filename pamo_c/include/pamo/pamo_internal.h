@@ -45,6 +45,43 @@ pamo_error pamo_mesh_append_face(pamo_mesh *m,
  * collision use. Idempotent on already-clean meshes. */
 pamo_error pamo_simplify_postprocess(pamo_mesh *mesh);
 
+/* ── Stage 2 collapse predicates + apply (src/stage2/collapse.c) ─── */
+
+/* Upper bound on 1-ring valence handled on the stack. ~30 is typical;
+ * 256 stays safe (2 KiB stack per call). When a vertex exceeds this
+ * the predicates conservatively report "unsafe" instead of truncating
+ * the neighbour list. */
+#define PAMO_MAX_VALENCE 256
+
+/* Returns true if collapsing endpoint→mid would flip an adjacent
+ * triangle's normal past `flip_threshold` (dot product) or produce a
+ * skinny triangle. Tests faces incident to `endpoint` only; call
+ * twice (u→mid, v→mid) for a symmetric check. */
+bool pamo_collapse_creates_problem(const pamo_mesh *m,
+                                   int32_t endpoint, int32_t other,
+                                   pamo_vec3d mid,
+                                   double skinny_thresh,
+                                   double flip_threshold);
+
+/* Topological link condition. Returns true if collapsing edge (u,v)
+ * would create a non-manifold vertex (interior edge: shared-neighbour
+ * count != 2; boundary edge: != 1; otherwise unsafe). */
+bool pamo_collapse_violates_link(const pamo_mesh *m, int32_t u, int32_t v);
+
+/* Predictive 1-ring tri-tri test. Returns true if collapsing (u,v)
+ * onto `mid` would produce self-intersecting triangles in the
+ * resulting 1-ring. O(K^2) tri-tri tests, K = local valence. */
+bool pamo_collapse_self_intersects(const pamo_mesh *m,
+                                   int32_t u, int32_t v,
+                                   pamo_vec3d mid);
+
+/* Perform the collapse: u absorbs v, mid becomes u's new position,
+ * v's faces are remapped to u (or marked dead if shared with u or
+ * degenerate after remap). Caller must have validated link condition
+ * etc. first. */
+void pamo_apply_collapse(pamo_mesh *m, int32_t u, int32_t v,
+                         pamo_vec3d mid);
+
 #ifdef __cplusplus
 }
 #endif

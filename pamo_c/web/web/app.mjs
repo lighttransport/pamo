@@ -42,22 +42,40 @@ function createViewport(host) {
         if (wire) { scene.remove(wire); wire.geometry.dispose(); wire.material.dispose(); wire = null; }
         if (!geometry) return;
         const useColor = !!opts.vertexColors;
-        const wireframe = !!opts.wireframe;
-        const mat = new THREE.MeshStandardMaterial({
-            color: useColor ? 0xffffff : 0xb6c2d2,
-            vertexColors: useColor,
-            metalness: 0.05, roughness: 0.85,
-            flatShading: false,
-            wireframe: false,
-            side: THREE.DoubleSide,
-        });
-        mesh = new THREE.Mesh(geometry, mat);
-        scene.add(mesh);
-        if (wireframe) {
-            const wmat = new THREE.LineBasicMaterial({ color: 0x222a36, transparent: true, opacity: 0.7 });
+        // shading: 'smooth' (default), 'flat', 'normals', 'wireframe'
+        const shading = opts.shading || 'smooth';
+
+        if (shading === 'wireframe') {
+            // Pure wireframe: no solid surface, just edges.
+            const wmat = new THREE.LineBasicMaterial({ color: 0xb6c2d2 });
             wire = new THREE.LineSegments(new THREE.WireframeGeometry(geometry), wmat);
             scene.add(wire);
+            // Keep the geometry alive on a hidden mesh so dispose() still works.
+            mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ visible: false }));
+            scene.add(mesh);
+            return;
         }
+
+        let mat;
+        if (shading === 'normals') {
+            // Per-face geometric normals — flatShading recomputes them in the
+            // shader from derivatives, bypassing the per-vertex averaged normals
+            // that smooth wobble across creases.
+            mat = new THREE.MeshNormalMaterial({
+                flatShading: true,
+                side: THREE.DoubleSide,
+            });
+        } else {
+            mat = new THREE.MeshStandardMaterial({
+                color: useColor ? 0xffffff : 0xb6c2d2,
+                vertexColors: useColor,
+                metalness: 0.05, roughness: 0.85,
+                flatShading: (shading === 'flat'),
+                side: THREE.DoubleSide,
+            });
+        }
+        mesh = new THREE.Mesh(geometry, mat);
+        scene.add(mesh);
     }
 
     function frame(box) {
@@ -440,25 +458,30 @@ async function run() {
 
 // Render whichever single output we have, plain (no diff colouring).
 function renderSinglePane() {
-    const wireframe = (ui.view.value === 'wireframe');
+    const shading = shadingFromMode(ui.view.value);
     vps.input.setMesh(buildGeometry(state.inputMesh.verts.slice(),
                                     state.inputMesh.faces.slice()),
-                      { wireframe });
+                      { shading });
     if (state.pamo) {
         vps.pamo.setMesh(buildGeometry(state.pamo.verts.slice(),
                                        state.pamo.faces.slice()),
-                         { wireframe });
+                         { shading });
     } else {
         vps.pamo.setMesh(null);
     }
     if (state.pamoC) {
         vps.pamo_c.setMesh(buildGeometry(state.pamoC.verts.slice(),
                                          state.pamoC.faces.slice()),
-                           { wireframe });
+                           { shading });
     } else {
         vps.pamo_c.setMesh(null);
     }
     ui.metrics.textContent = '';
+}
+
+function shadingFromMode(mode) {
+    if (mode === 'flat' || mode === 'normals' || mode === 'wireframe') return mode;
+    return 'smooth';
 }
 
 async function runPython(opts) {
@@ -509,18 +532,18 @@ function recolour() {
     const mode = ui.view.value;
     const scaleAbs = state.inputBounds.diameter * (+ui.cscale.value) / 100;
 
-    const wireframe = (mode === 'wireframe');
+    const shading = shadingFromMode(mode);
     const useColors = (mode === 'diff-input' || mode === 'diff-other');
 
-    // Plain / wireframe view
+    // Non-diff view (smooth / flat / normals / wireframe)
     if (!useColors) {
         const pg = buildGeometry(state.pamo.verts.slice(), state.pamo.faces.slice());
         const cg = buildGeometry(state.pamoC.verts.slice(), state.pamoC.faces.slice());
-        vps.pamo.setMesh(pg, { wireframe });
-        vps.pamo_c.setMesh(cg, { wireframe });
+        vps.pamo.setMesh(pg, { shading });
+        vps.pamo_c.setMesh(cg, { shading });
         vps.input.setMesh(buildGeometry(state.inputMesh.verts.slice(),
                                         state.inputMesh.faces.slice()),
-                          { wireframe });
+                          { shading });
         ui.metrics.textContent = '';
         return;
     }

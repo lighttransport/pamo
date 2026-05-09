@@ -16,7 +16,7 @@ import torchcumesh2sdf
 
 
 class PaMO(nn.Module):
-    def __init__(self, input_mesh, use_stage1 = True, use_stage3 = True):
+    def __init__(self, input_mesh, use_stage1 = True, use_stage3 = True, stage3_config = None):
         super().__init__()
         pamo = _C.CUDSP_Free()
 
@@ -32,7 +32,14 @@ class PaMO(nn.Module):
         self.gt_mesh = copy.deepcopy(input_mesh)
         
         if self.use_stage3:
-            self.config = pamo_safe_project.config.Stage3Config()  # default config
+            self.config = stage3_config if stage3_config is not None else pamo_safe_project.config.Stage3Config()
+            print(
+                "Stage3 memory caps : "
+                f"max_particles={self.config.max_particles}, "
+                f"max_blocks={self.config.max_blocks}, "
+                f"max_gt_particles={self.config.max_gt_particles}, "
+                f"max_gt_samples={self.config.max_gt_samples}"
+            )
             self.system = pamo_safe_project.system.Stage3System(self.config)  # create a system (with all the cuda arrays)
 
         class DSPFunction(Function):
@@ -164,6 +171,29 @@ class PaMO(nn.Module):
         
         # stage3 (Safe projection)
         if self.use_stage3 == True:
+            max_faces = self.config.max_particles * 2 + 1024
+            max_gt_faces = self.config.max_gt_particles * 2 + 1024
+            if len(verts) > self.config.max_particles:
+                raise RuntimeError(
+                    "Stage3 max_particles is too small: "
+                    f"need {len(verts)}, cap {self.config.max_particles}"
+                )
+            if len(faces) > max_faces:
+                raise RuntimeError(
+                    "Stage3 face capacity is too small: "
+                    f"need {len(faces)}, cap {max_faces}"
+                )
+            if len(self.gt_mesh.vertices) > self.config.max_gt_particles:
+                raise RuntimeError(
+                    "Stage3 max_gt_particles is too small: "
+                    f"need {len(self.gt_mesh.vertices)}, "
+                    f"cap {self.config.max_gt_particles}"
+                )
+            if len(self.gt_mesh.faces) > max_gt_faces:
+                raise RuntimeError(
+                    "Stage3 GT face capacity is too small: "
+                    f"need {len(self.gt_mesh.faces)}, cap {max_gt_faces}"
+                )
             stage2_mesh = trimesh.Trimesh(vertices=verts, faces=faces)
             verts, faces = pamo_safe_project.process(
                 self.gt_mesh.vertices,

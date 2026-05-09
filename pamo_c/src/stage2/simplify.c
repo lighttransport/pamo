@@ -85,8 +85,10 @@ static const double COST_INF = 1e20;
  * on thin sliver features from flinging verts across the model. */
 static pamo_vec3d choose_placement(const pamo_quadric *Qsum,
                                    pamo_vec3d pu, pamo_vec3d pv,
-                                   double scale) {
+                                   double scale,
+                                   bool *used_optimal_out) {
     pamo_vec3d mid = pamo_v3_scale(pamo_v3_add(pu, pv), 0.5);
+    if (used_optimal_out) *used_optimal_out = false;
     pamo_vec3d opt;
     /* cond_eps is unit-less (det/trace^3-normalised). 1e-9 catches
      * rank-deficient A (planar region) without rejecting full-rank
@@ -101,6 +103,7 @@ static pamo_vec3d choose_placement(const pamo_quadric *Qsum,
     double max_off  = 4.0 * (edge_len > scale ? edge_len : scale);
     pamo_vec3d delta = pamo_v3_sub(opt, mid);
     if (pamo_v3_length_sq(delta) > max_off * max_off) return mid;
+    if (used_optimal_out) *used_optimal_out = true;
     return opt;
 }
 
@@ -252,7 +255,7 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
     pamo_vec3d pu = m->verts[u];
     pamo_vec3d pv = m->verts[v];
     pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
-    pamo_vec3d mid = choose_placement(&Qsum, pu, pv, scale);
+    pamo_vec3d mid = choose_placement(&Qsum, pu, pv, scale, NULL);
 
     /* Normal flip / skinny check for both endpoints. */
     if (collapse_creates_problem(m, u, v, mid, skinny_thresh, flip_threshold))
@@ -617,21 +620,44 @@ static pamo_error simplify_round(pamo_mesh *m,
         if (!safe) continue;
 
         pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
+        bool used_optimal = false;
         pamo_vec3d mid = choose_placement(&Qsum, m->verts[u],
-                                          m->verts[v], scale);
+                                          m->verts[v], scale,
+                                          &used_optimal);
         /* Input-surface attraction: blend the QEM placement toward the
-         * nearest point on the *original* input surface. Cheap to do
-         * per applied-collapse (one BVH query) but counter-acts the
-         * cumulative drift that propagated quadrics still leave on
-         * highly-textured regions (BirdHouse foundation/base). */
-        if (attract_bvh && attract_mesh && opts->surface_attract_weight > 0.0) {
+         * nearest point on the *original* input surface to counter
+         * cumulative drift on highly-textured flat regions (BirdHouse
+         * foundation/base).
+         *
+         * Skip when choose_placement landed on the QEM optimum: a
+         * full-rank Qsum already pins the placement to feature corners
+         * /edges, and a BVH-nearest pull there can drag the corner
+         * onto the closer adjacent face — visible as triangular
+         * "chips" along grooves and inset edges. We only need
+         * attraction in the rank-deficient case (planar regions where
+         * Qsum has lost its constraint). The pull is also clamped to
+         * one local edge-length so a stray nearest point on a
+         * different surface (e.g. the opposite wall of a groove) can
+         * never yank the placement across a feature. */
+        if (attract_bvh && attract_mesh
+            && !used_optimal
+            && opts->surface_attract_weight > 0.0) {
             pamo_nearest_result nr;
             if (pamo_bvh_nearest(attract_bvh, attract_mesh, mid, &nr) == PAMO_OK) {
                 double w = opts->surface_attract_weight;
                 if (w > 1.0) w = 1.0;
-                mid.x = mid.x + w * (nr.point.x - mid.x);
-                mid.y = mid.y + w * (nr.point.y - mid.y);
-                mid.z = mid.z + w * (nr.point.z - mid.z);
+                pamo_vec3d edge_v = pamo_v3_sub(m->verts[v], m->verts[u]);
+                double edge_len = sqrt(pamo_v3_length_sq(edge_v));
+                pamo_vec3d delta = pamo_v3_sub(nr.point, mid);
+                double d2 = pamo_v3_length_sq(delta);
+                double max_pull = edge_len;
+                if (d2 > max_pull * max_pull && d2 > 0.0) {
+                    double s = max_pull / sqrt(d2);
+                    delta = pamo_v3_scale(delta, s);
+                }
+                mid.x = mid.x + w * delta.x;
+                mid.y = mid.y + w * delta.y;
+                mid.z = mid.z + w * delta.z;
             }
         }
         if (opts->check_self_intersection &&

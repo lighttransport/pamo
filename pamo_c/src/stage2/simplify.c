@@ -1037,5 +1037,179 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
         if (err != PAMO_OK) return err;
     }
 
+    /* ── Hole-fill: close every boundary loop with a centroid fan ──── */
+    /* For collision-detection use the output must be watertight. After
+     * the bowtie split we still leave whatever boundary chains the
+     * collapse loop produced (and any boundaries already present in
+     * the Stage 1 / input mesh). Walk each closed loop of boundary
+     * edges and fan-triangulate it from a centroid vertex. Triangle
+     * winding is taken from the directed boundary edge so the fill
+     * faces the outside. */
+    {
+        pamo_error err = pamo_mesh_build_adjacency(mesh);
+        if (err != PAMO_OK) return err;
+
+        size_t n_bdy = 0;
+        for (size_t ei = 0; ei < mesh->n_edges; ei++) {
+            if (mesh->edge_face_offset[ei + 1] - mesh->edge_face_offset[ei] == 1)
+                n_bdy++;
+        }
+        if (n_bdy == 0) {
+            pamo_mesh_free_adjacency(mesh);
+            return PAMO_OK;
+        }
+
+        /* Directed boundary edges (from→to) lifted from each owning
+         * face's vertex order so the loop walks in a consistent
+         * direction along the surface. */
+        int32_t *be_from = PAMO_ALLOC_ARRAY(&mesh->alloc, int32_t, n_bdy);
+        int32_t *be_to   = PAMO_ALLOC_ARRAY(&mesh->alloc, int32_t, n_bdy);
+        bool    *be_used = PAMO_ALLOC_ARRAY(&mesh->alloc, bool,    n_bdy);
+        if (!be_from || !be_to || !be_used) {
+            if (be_from) PAMO_FREE_ARRAY(&mesh->alloc, be_from, int32_t, n_bdy);
+            if (be_to)   PAMO_FREE_ARRAY(&mesh->alloc, be_to,   int32_t, n_bdy);
+            if (be_used) PAMO_FREE_ARRAY(&mesh->alloc, be_used, bool,    n_bdy);
+            pamo_mesh_free_adjacency(mesh);
+            return PAMO_ERR_ALLOC;
+        }
+
+        for (size_t i = 0; i < n_bdy; i++) be_used[i] = false;
+        size_t nb = 0;
+        for (size_t ei = 0; ei < mesh->n_edges; ei++) {
+            if (mesh->edge_face_offset[ei + 1]
+                - mesh->edge_face_offset[ei] != 1) continue;
+            int32_t u = mesh->edges[ei].u, v = mesh->edges[ei].v;
+            int32_t fi = mesh->edge_face_list[mesh->edge_face_offset[ei]];
+            const int32_t *fv = mesh->faces[fi].v;
+            for (int k = 0; k < 3; k++) {
+                int32_t a = fv[k], b = fv[(k + 1) % 3];
+                if ((a == u && b == v) || (a == v && b == u)) {
+                    be_from[nb] = a;
+                    be_to[nb]   = b;
+                    nb++;
+                    break;
+                }
+            }
+        }
+
+        pamo_mesh_free_adjacency(mesh);
+
+        /* Walk loops by chaining (to == next.from). We scan linearly
+         * to find the next unused boundary edge whose `from` matches
+         * the current `to`; quadratic in n_bdy but n_bdy is tiny
+         * (a handful of edges in practice). */
+        int32_t *loop = PAMO_ALLOC_ARRAY(&mesh->alloc, int32_t, n_bdy);
+        if (!loop) {
+            PAMO_FREE_ARRAY(&mesh->alloc, be_from, int32_t, n_bdy);
+            PAMO_FREE_ARRAY(&mesh->alloc, be_to,   int32_t, n_bdy);
+            PAMO_FREE_ARRAY(&mesh->alloc, be_used, bool,    n_bdy);
+            return PAMO_ERR_ALLOC;
+        }
+
+        for (size_t seed = 0; seed < n_bdy; seed++) {
+            if (be_used[seed]) continue;
+            size_t L = 0;
+            int32_t start = be_from[seed];
+            size_t ci = seed;
+            bool closed = false;
+            for (size_t step = 0; step < n_bdy + 1; step++) {
+                if (be_used[ci]) break;
+                be_used[ci] = true;
+                loop[L++] = be_from[ci];
+                int32_t next_v = be_to[ci];
+                if (next_v == start) { closed = true; break; }
+                size_t found = SIZE_MAX;
+                for (size_t k = 0; k < n_bdy; k++) {
+                    if (!be_used[k] && be_from[k] == next_v) {
+                        found = k; break;
+                    }
+                }
+                if (found == SIZE_MAX) break;
+                ci = found;
+            }
+            if (!closed || L < 3) continue;
+
+            /* Centroid of loop verts (placement only, not error-aware
+             * — for collision the topology matters far more than the
+             * exact fill shape, and a centroid never falls outside a
+             * convex hole). */
+            pamo_vec3d c = {0, 0, 0};
+            for (size_t i = 0; i < L; i++) {
+                c.x += mesh->verts[loop[i]].x;
+                c.y += mesh->verts[loop[i]].y;
+                c.z += mesh->verts[loop[i]].z;
+            }
+            c.x /= (double)L; c.y /= (double)L; c.z /= (double)L;
+
+            /* Append centroid vertex (grow as needed). */
+            if (mesh->n_verts >= mesh->n_verts_cap) {
+                size_t old_cap = mesh->n_verts_cap;
+                size_t new_cap = old_cap ? old_cap * 2 : 16;
+                pamo_vec3d *nv = (pamo_vec3d *)PAMO_REALLOC(
+                    &mesh->alloc, mesh->verts,
+                    old_cap * sizeof(pamo_vec3d),
+                    new_cap * sizeof(pamo_vec3d));
+                bool *na = (bool *)PAMO_REALLOC(
+                    &mesh->alloc, mesh->vert_alive,
+                    old_cap * sizeof(bool),
+                    new_cap * sizeof(bool));
+                if (!nv || !na) {
+                    PAMO_FREE_ARRAY(&mesh->alloc, loop, int32_t, n_bdy);
+                    PAMO_FREE_ARRAY(&mesh->alloc, be_from, int32_t, n_bdy);
+                    PAMO_FREE_ARRAY(&mesh->alloc, be_to,   int32_t, n_bdy);
+                    PAMO_FREE_ARRAY(&mesh->alloc, be_used, bool,    n_bdy);
+                    return PAMO_ERR_ALLOC;
+                }
+                mesh->verts = nv;
+                mesh->vert_alive = na;
+                mesh->n_verts_cap = new_cap;
+            }
+            int32_t cv = (int32_t)mesh->n_verts++;
+            mesh->verts[cv] = c;
+            mesh->vert_alive[cv] = true;
+
+            /* Fan-triangulate. The boundary half-edge (a→b) lives in
+             * exactly one face whose third vertex is on the SURFACE
+             * side; the fill triangle (cv, b, a) — reversed winding
+             * — therefore faces outward. */
+            for (size_t i = 0; i < L; i++) {
+                int32_t a = loop[i];
+                int32_t b = loop[(i + 1) % L];
+                if (mesh->n_faces >= mesh->n_faces_cap) {
+                    size_t old_cap = mesh->n_faces_cap;
+                    size_t new_cap = old_cap ? old_cap * 2 : 16;
+                    pamo_tri *nf = (pamo_tri *)PAMO_REALLOC(
+                        &mesh->alloc, mesh->faces,
+                        old_cap * sizeof(pamo_tri),
+                        new_cap * sizeof(pamo_tri));
+                    bool *nfa = (bool *)PAMO_REALLOC(
+                        &mesh->alloc, mesh->face_alive,
+                        old_cap * sizeof(bool),
+                        new_cap * sizeof(bool));
+                    if (!nf || !nfa) {
+                        PAMO_FREE_ARRAY(&mesh->alloc, loop, int32_t, n_bdy);
+                        PAMO_FREE_ARRAY(&mesh->alloc, be_from, int32_t, n_bdy);
+                        PAMO_FREE_ARRAY(&mesh->alloc, be_to,   int32_t, n_bdy);
+                        PAMO_FREE_ARRAY(&mesh->alloc, be_used, bool,    n_bdy);
+                        return PAMO_ERR_ALLOC;
+                    }
+                    mesh->faces = nf;
+                    mesh->face_alive = nfa;
+                    mesh->n_faces_cap = new_cap;
+                }
+                int32_t fi = (int32_t)mesh->n_faces++;
+                mesh->faces[fi].v[0] = cv;
+                mesh->faces[fi].v[1] = b;
+                mesh->faces[fi].v[2] = a;
+                mesh->face_alive[fi] = true;
+            }
+        }
+
+        PAMO_FREE_ARRAY(&mesh->alloc, loop, int32_t, n_bdy);
+        PAMO_FREE_ARRAY(&mesh->alloc, be_from, int32_t, n_bdy);
+        PAMO_FREE_ARRAY(&mesh->alloc, be_to,   int32_t, n_bdy);
+        PAMO_FREE_ARRAY(&mesh->alloc, be_used, bool,    n_bdy);
+    }
+
     return PAMO_OK;
 }

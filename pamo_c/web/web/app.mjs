@@ -231,7 +231,16 @@ ui.cscale.addEventListener('input', () => {
 });
 
 ui.view.addEventListener('change', () => {
-    if (state.pamo && state.pamoC) recolour();
+    if (!state.inputMesh) return;
+    // Diff modes need both ports; everything else (smooth/flat/normals/
+    // wireframe) just re-renders whatever we have.
+    const mode = ui.view.value;
+    if ((mode === 'diff-input' || mode === 'diff-other')
+        && state.pamo && state.pamoC) {
+        recolour();
+    } else {
+        renderSinglePane();
+    }
 });
 
 ui.run.addEventListener('click', run);

@@ -230,9 +230,12 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
             int32_t iyhi = (int32_t)ceil ((yhi - grid_origin.y) / voxel_size);
             int32_t izlo = (int32_t)floor((zlo - grid_origin.z) / voxel_size);
             int32_t izhi = (int32_t)ceil ((zhi - grid_origin.z) / voxel_size);
-            if (ixlo < 0) ixlo = 0; if (ixhi > R-1) ixhi = R-1;
-            if (iylo < 0) iylo = 0; if (iyhi > R-1) iyhi = R-1;
-            if (izlo < 0) izlo = 0; if (izhi > R-1) izhi = R-1;
+            if (ixlo < 0) ixlo = 0;
+            if (ixhi > R - 1) ixhi = R - 1;
+            if (iylo < 0) iylo = 0;
+            if (iyhi > R - 1) iyhi = R - 1;
+            if (izlo < 0) izlo = 0;
+            if (izhi > R - 1) izhi = R - 1;
             for (int32_t iz = izlo; iz <= izhi; iz++)
                 for (int32_t iy = iylo; iy <= iyhi; iy++)
                     for (int32_t ix = ixlo; ix <= ixhi; ix++)

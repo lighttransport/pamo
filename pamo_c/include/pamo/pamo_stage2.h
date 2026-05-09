@@ -28,7 +28,13 @@ typedef struct {
     int32_t min_faces;              /* absolute minimum (default 10) */
     int32_t max_iters;              /* max simplification rounds (default 100) */
     int32_t tolerance;              /* stuck iterations before quit (default 4) */
-    int32_t max_undo_retries;       /* self-intersection undo retries (default 5) */
+    int32_t max_undo_retries;       /* DEPRECATED — currently unused. Kept
+                                     * for ABI stability of struct callers
+                                     * (e.g. pamo_c/web/binding.cc). The
+                                     * undo path was never wired up; the
+                                     * runtime predictive self-intersection
+                                     * test (check_self_intersection) is
+                                     * the actual safety net. */
     double  skinny_area_threshold;  /* skinny triangle area threshold (default 1e-6) */
     double  skinny_penalty_weight;  /* weight for skinny cost term (default 5.0) */
     double  cost_range;             /* cost clamp range (default 10.0) */

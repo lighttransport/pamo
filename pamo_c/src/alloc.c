@@ -93,21 +93,6 @@ static size_t record_remove(pamo_tracking_ctx *t, void *ptr) {
     return 0; /* not found */
 }
 
-static void record_update(pamo_tracking_ctx *t, void *old_ptr,
-                          void *new_ptr, size_t new_size) {
-    pamo_alloc_record *r = t->live;
-    while (r) {
-        if (r->ptr == old_ptr) {
-            r->ptr  = new_ptr;
-            r->size = new_size;
-            return;
-        }
-        r = r->next;
-    }
-    /* old_ptr not found -- treat as new alloc. */
-    record_add(t, new_ptr, new_size);
-}
-
 static void *tracking_alloc(size_t size, void *ctx) {
     pamo_tracking_ctx *t = (pamo_tracking_ctx *)ctx;
     if (size == 0) return NULL;
@@ -138,20 +123,29 @@ static void *tracking_realloc(void *ptr, size_t old_size, size_t new_size,
     if (!ptr) {
         return tracking_alloc(new_size, ctx);
     }
-    /* Find actual old size from records. */
+    /* Locate the record up-front and keep a direct handle. realloc
+     * may invalidate ptr, so doing the lookup afterwards (with an
+     * old_ptr key) is technically a use-after-free even though we
+     * only compare the pointer value — silence the warning and avoid
+     * a second list walk by writing the new ptr/size into the record
+     * we already found. */
     size_t actual_old = 0;
-    pamo_alloc_record *r = t->live;
-    while (r) {
-        if (r->ptr == ptr) { actual_old = r->size; break; }
-        r = r->next;
+    pamo_alloc_record *rec = t->live;
+    while (rec) {
+        if (rec->ptr == ptr) { actual_old = rec->size; break; }
+        rec = rec->next;
     }
-    void *old_ptr = ptr;
     void *p = realloc(ptr, new_size);
     if (!p) return NULL;
     if (new_size > actual_old) {
         memset((char *)p + actual_old, 0, new_size - actual_old);
     }
-    record_update(t, old_ptr, p, new_size);
+    if (rec) {
+        rec->ptr = p;
+        rec->size = new_size;
+    } else {
+        record_add(t, p, new_size);
+    }
     if (new_size > actual_old) {
         t->total_allocated += (new_size - actual_old);
         t->current += (new_size - actual_old);

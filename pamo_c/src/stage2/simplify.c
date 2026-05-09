@@ -390,12 +390,16 @@ static bool collapse_self_intersects(const pamo_mesh *m,
     return false;
 }
 
-/* ── Collapse record for undo ────────────────────────────────────── */
+/* ── Collapse record (cost-sorted edge to apply) ────────────────────
+ * The driver computes per-edge costs once per round on a snapshot of
+ * the topology, sorts ascending, then replays the top-N candidates.
+ * Only the endpoint pair is needed: u/v positions can change between
+ * sort and apply, so we re-read live mesh state at apply time and
+ * re-validate the link condition. (orig_u/orig_v/undone fields lived
+ * here for an undo path that was never wired up — dropped.) */
 
 typedef struct {
-    int32_t    u, v;
-    pamo_vec3d orig_u, orig_v;
-    bool       undone;
+    int32_t u, v;
 } pamo_collapse_record;
 
 /* ── Apply collapse ──────────────────────────────────────────────── */
@@ -549,9 +553,6 @@ static pamo_error simplify_round(pamo_mesh *m,
 
         records[n_accepted].u = u;
         records[n_accepted].v = v;
-        records[n_accepted].orig_u = m->verts[u];
-        records[n_accepted].orig_v = m->verts[v];
-        records[n_accepted].undone = false;
         n_accepted++;
     }
 

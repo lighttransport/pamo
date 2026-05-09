@@ -918,7 +918,11 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
         if (err != PAMO_OK) return err;
 
         bool found_any = false;
-        for (size_t vi = 0; vi < mesh->n_verts; vi++) {
+        /* Pin the scan range to the pre-split count; new vertex copies we
+         * append below have only one fan by construction and never need
+         * splitting themselves on this pass. */
+        const size_t scan_limit = mesh->n_verts;
+        for (size_t vi = 0; vi < scan_limit; vi++) {
             if (!mesh->vert_alive[vi]) continue;
             int32_t s = mesh->vert_face_offset[vi];
             int32_t e = mesh->vert_face_offset[vi + 1];
@@ -932,50 +936,95 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
                 inc_faces[n_inc++] = fi;
             }
             /* Skip extreme-valence vertices rather than truncating their
-             * incident-face list, which would misreport the component
-             * count and could delete real geometry. */
+             * incident-face list — a truncated component count could
+             * misclassify a manifold vertex as a bowtie. */
             if (inc_overflow) continue;
             if (n_inc <= 1) continue;
 
-            /* BFS over face adjacency around this vertex. */
-            bool visited[PAMO_MAX_VALENCE] = {false};
-            visited[0] = true;
+            /* Group incident faces into 1-ring-fan components by walking
+             * face-face adjacency around vi (two faces are adjacent iff
+             * they share a non-vi vertex). A 2-manifold vertex has
+             * exactly one component; multiple components = bowtie. */
+            int8_t comp_id[PAMO_MAX_VALENCE];
+            for (int32_t i = 0; i < n_inc; i++) comp_id[i] = -1;
+            int32_t n_comps = 0;
             int32_t queue[PAMO_MAX_VALENCE];
-            queue[0] = 0;
-            int32_t qhead = 0, qtail = 1;
-            while (qhead < qtail) {
-                int32_t ci = queue[qhead++];
-                int32_t fi = inc_faces[ci];
-                const int32_t *fv = mesh->faces[fi].v;
-                int32_t others[2], no = 0;
-                for (int k = 0; k < 3; k++)
-                    if (fv[k] != (int32_t)vi && no < 2) others[no++] = fv[k];
-
-                for (int32_t ci2 = 0; ci2 < n_inc; ci2++) {
-                    if (visited[ci2]) continue;
-                    int32_t fi2 = inc_faces[ci2];
-                    const int32_t *gv = mesh->faces[fi2].v;
-                    bool adj = false;
-                    for (int a = 0; a < no && !adj; a++)
-                        for (int b = 0; b < 3 && !adj; b++)
-                            if (gv[b] == others[a] && gv[b] != (int32_t)vi)
-                                adj = true;
-                    if (adj) {
-                        visited[ci2] = true;
-                        queue[qtail++] = ci2;
+            for (int32_t seed = 0; seed < n_inc; seed++) {
+                if (comp_id[seed] >= 0) continue;
+                int32_t qh = 0, qt = 0;
+                queue[qt++] = seed;
+                comp_id[seed] = (int8_t)n_comps;
+                while (qh < qt) {
+                    int32_t ci = queue[qh++];
+                    int32_t fi = inc_faces[ci];
+                    const int32_t *fv = mesh->faces[fi].v;
+                    int32_t others[2], no = 0;
+                    for (int k = 0; k < 3; k++)
+                        if (fv[k] != (int32_t)vi && no < 2) others[no++] = fv[k];
+                    for (int32_t ci2 = 0; ci2 < n_inc; ci2++) {
+                        if (comp_id[ci2] >= 0) continue;
+                        int32_t fi2 = inc_faces[ci2];
+                        const int32_t *gv = mesh->faces[fi2].v;
+                        bool adj = false;
+                        for (int a = 0; a < no && !adj; a++)
+                            for (int b = 0; b < 3 && !adj; b++)
+                                if (gv[b] == others[a]
+                                    && gv[b] != (int32_t)vi)
+                                    adj = true;
+                        if (adj) {
+                            comp_id[ci2] = (int8_t)n_comps;
+                            queue[qt++] = ci2;
+                        }
                     }
                 }
+                n_comps++;
+            }
+            if (n_comps <= 1) continue;
+
+            /* Bowtie. Keep the largest component on vi and split the
+             * others off onto fresh vertex copies (preserves all
+             * geometry — face deletion would tear holes, breaking the
+             * watertight requirement). */
+            found_any = true;
+            int32_t comp_size[PAMO_MAX_VALENCE] = {0};
+            for (int32_t i = 0; i < n_inc; i++) comp_size[comp_id[i]]++;
+            int8_t keep = 0;
+            for (int8_t k = 1; k < (int8_t)n_comps; k++) {
+                if (comp_size[k] > comp_size[keep]) keep = k;
             }
 
-            if (qtail < n_inc) {
-                /* Multiple components. Kill faces NOT in the largest. */
-                /* First component is visited[0..qtail-1]. Count others. */
-                /* Simple: just kill all faces in smaller components. */
-                found_any = true;
-                for (int32_t ci = 0; ci < n_inc; ci++) {
-                    if (!visited[ci]) {
-                        mesh->face_alive[inc_faces[ci]] = false;
+            for (int8_t k = 0; k < (int8_t)n_comps; k++) {
+                if (k == keep) continue;
+                /* Append a copy of vi. Grow verts/vert_alive if needed. */
+                if (mesh->n_verts >= mesh->n_verts_cap) {
+                    size_t old_cap = mesh->n_verts_cap;
+                    size_t new_cap = old_cap ? old_cap * 2 : 16;
+                    pamo_vec3d *nv = (pamo_vec3d *)PAMO_REALLOC(
+                        &mesh->alloc, mesh->verts,
+                        old_cap * sizeof(pamo_vec3d),
+                        new_cap * sizeof(pamo_vec3d));
+                    bool *na = (bool *)PAMO_REALLOC(
+                        &mesh->alloc, mesh->vert_alive,
+                        old_cap * sizeof(bool),
+                        new_cap * sizeof(bool));
+                    if (!nv || !na) {
+                        pamo_mesh_free_adjacency(mesh);
+                        return PAMO_ERR_ALLOC;
                     }
+                    mesh->verts = nv;
+                    mesh->vert_alive = na;
+                    mesh->n_verts_cap = new_cap;
+                }
+                int32_t new_vi = (int32_t)mesh->n_verts++;
+                mesh->verts[new_vi] = mesh->verts[vi];
+                mesh->vert_alive[new_vi] = true;
+
+                for (int32_t i = 0; i < n_inc; i++) {
+                    if (comp_id[i] != k) continue;
+                    int32_t fi = inc_faces[i];
+                    int32_t *fv = mesh->faces[fi].v;
+                    for (int j = 0; j < 3; j++)
+                        if (fv[j] == (int32_t)vi) fv[j] = new_vi;
                 }
             }
         }

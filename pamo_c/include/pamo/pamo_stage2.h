@@ -23,7 +23,7 @@ typedef struct {
     double  skinny_penalty_weight;  /* weight for skinny cost term (default 5.0) */
     double  cost_range;             /* cost clamp range (default 10.0) */
     double  fold_guard_min_dot;     /* reject collapses if adjacent post-collapse normals dot below this (default -0.2) */
-    bool    check_self_intersection; /* enable self-intersection rollback (default false) */
+    bool    check_self_intersection; /* enable self-intersection rollback (default true) */
 } pamo_simplify_opts;
 
 pamo_simplify_opts pamo_simplify_opts_default(void);

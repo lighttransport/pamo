@@ -176,6 +176,9 @@ static pamo_vec3d v3_normalize_or_zero(pamo_vec3d v) {
 
 static double dmc_qef_blend(void) {
     static int checked = 0;
+    /* Keep the default aligned with the reference CUDA PaMO path, which uses
+     * the DMC vertex placement directly. QEF pull is useful for experiments,
+     * but can open thin sheet features on production meshes. */
     static double blend = 0.0;
     if (!checked) {
         const char *e = getenv("PAMO_DMC_QEF_BLEND");

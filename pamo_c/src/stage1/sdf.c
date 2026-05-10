@@ -82,9 +82,17 @@ static lightrt_bvh *build_lightrt_from_mesh(const pamo_mesh *m) {
     }
     for (size_t i = 0; i < m->n_faces; i++) {
         if (!m->face_alive[i]) continue;
+        if (!pamo_mesh_face_is_valid(m, i)) {
+            free(rm); free(fv); free(fi);
+            return NULL;
+        }
         fi[af*3]   = rm[m->faces[i].v[0]];
         fi[af*3+1] = rm[m->faces[i].v[1]];
         fi[af*3+2] = rm[m->faces[i].v[2]];
+        if (fi[af*3] < 0 || fi[af*3+1] < 0 || fi[af*3+2] < 0) {
+            free(rm); free(fv); free(fi);
+            return NULL;
+        }
         af++;
     }
     free(rm);
@@ -214,6 +222,10 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
         double band_d = (double)band;
         for (size_t fi = 0; fi < m->n_faces; fi++) {
             if (!m->face_alive[fi]) continue;
+            if (!pamo_mesh_face_is_valid(m, fi)) {
+                free(dist); free(collide); free(active);
+                return PAMO_ERR_INVALID_ARG;
+            }
             const int32_t *fv = m->faces[fi].v;
             double v0x=m->verts[fv[0]].x, v0y=m->verts[fv[0]].y, v0z=m->verts[fv[0]].z;
             double v1x=m->verts[fv[1]].x, v1y=m->verts[fv[1]].y, v1z=m->verts[fv[1]].z;
@@ -230,9 +242,12 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
             int32_t iyhi = (int32_t)ceil ((yhi - grid_origin.y) / voxel_size);
             int32_t izlo = (int32_t)floor((zlo - grid_origin.z) / voxel_size);
             int32_t izhi = (int32_t)ceil ((zhi - grid_origin.z) / voxel_size);
-            if (ixlo < 0) ixlo = 0; if (ixhi > R-1) ixhi = R-1;
-            if (iylo < 0) iylo = 0; if (iyhi > R-1) iyhi = R-1;
-            if (izlo < 0) izlo = 0; if (izhi > R-1) izhi = R-1;
+            if (ixlo < 0) ixlo = 0;
+            if (ixhi > R - 1) ixhi = R - 1;
+            if (iylo < 0) iylo = 0;
+            if (iyhi > R - 1) iyhi = R - 1;
+            if (izlo < 0) izlo = 0;
+            if (izhi > R - 1) izhi = R - 1;
             for (int32_t iz = izlo; iz <= izhi; iz++)
                 for (int32_t iy = iylo; iy <= iyhi; iy++)
                     for (int32_t ix = ixlo; ix <= ixhi; ix++)
@@ -258,14 +273,18 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
     }
     if (use_lightrt) {
         lbvh = build_lightrt_from_mesh(m);
+        PAMO_SDF_TICK("lightrt-bvh-build");
         if (!lbvh) use_lightrt = 0;  /* graceful fallback on alloc failure */
     }
 #endif
+    if (prof) {
+        fprintf(stderr, "[sdf-prof] %-22s %s\n",
+                "sdf-backend", use_lightrt ? "lightrt" : "pamo-fallback");
+    }
 
     /* ── Phase 1: Narrow-band distance computation ───────────────── */
     if (use_lightrt) {
 #ifdef PAMO_USE_LIGHTRT
-        float band_sq = band * band;
 #ifdef PAMO_USE_PTHREADS
         /* Thread count: env override PAMO_NUM_THREADS, else online CPUs
          * (clamped to [1, R]; per-z-slab partition gives at most R tasks). */
@@ -293,6 +312,7 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
         for (int t = 0; t < nt; t++) pthread_join(thr[t], NULL);
         free(thr); free(args);
 #else
+        float band_sq = band * band;
         for (int32_t iz = 0; iz < R; iz++)
             for (int32_t iy = 0; iy < R; iy++)
                 for (int32_t ix = 0; ix < R; ix++) {
@@ -314,7 +334,10 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                                     grid_origin.y+((double)iy+0.5)*voxel_size,
                                     grid_origin.z+((double)iz+0.5)*voxel_size};
                     pamo_nearest_result res;
-                    pamo_bvh_nearest(bvh, m, p, &res);
+                    if (pamo_bvh_nearest(bvh, m, p, &res) != PAMO_OK ||
+                        res.prim_id < 0) {
+                        continue;
+                    }
                     float d = (float)sqrt(res.dist_sq);
                     if (d < band) dist[idx] = d;
                 }
@@ -425,22 +448,37 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
     if (!parent) { free(dist); free(collide); free(active); return PAMO_ERR_ALLOC; }
     for (size_t i = 0; i < uf_size; i++) parent[i] = (int32_t)i;
 
-    /* Prescan: walk X-columns, link consecutive voxels that aren't
-     * near the surface (dist*N >= 0.87, matching cumesh2sdf). */
+    /* Prescan: walk X-columns, matching cumesh2sdf's
+     * volume_sign_prescan_kernel. The `skip` state is important on open
+     * meshes: it prevents far-field spans from being chained through
+     * narrow ambiguous bands and reduces false inside pockets. */
     float prescan_thresh = SDF_PRESCAN_COEFF / (float)R * vs * (float)R;
+    float prescan_skip_thresh = 2.0f * vs;
     for (int32_t iz = 0; iz < R; iz++)
         for (int32_t iy = 0; iy < R; iy++) {
+            bool skip = false;
+            bool flag = false;
             int32_t chain_start = 0; /* boundary sentinel */
             for (int32_t ix = 0; ix < R; ix++) {
                 size_t idx = GRID_IDX(ix, iy, iz, R);
                 int32_t node = (int32_t)(idx + 1);
-                if (dist[idx] < prescan_thresh) {
-                    /* Near surface: start new chain. */
-                    chain_start = node;
+                if (skip) {
+                    skip = false;
+                    if (flag) {
+                        flag = false;
+                        chain_start = node;
+                    }
                 } else {
-                    /* Far from surface: link to current chain. */
-                    parent[node] = chain_start;
+                    if (dist[idx] < prescan_thresh) {
+                        flag = true;
+                        chain_start = node;
+                    } else if (flag) {
+                        flag = false;
+                        chain_start = node;
+                    }
+                    skip = dist[idx] > prescan_skip_thresh;
                 }
+                parent[node] = chain_start;
             }
         }
 

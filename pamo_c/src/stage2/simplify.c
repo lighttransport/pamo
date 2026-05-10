@@ -24,6 +24,7 @@ pamo_simplify_opts pamo_simplify_opts_default(void) {
         .skinny_area_threshold   = 1e-6,
         .skinny_penalty_weight   = 5.0,
         .cost_range              = 10.0,
+        .fold_guard_min_dot      = -0.2,
         .check_self_intersection = false,
     };
 }
@@ -43,6 +44,7 @@ static void compute_quadrics(const pamo_mesh *m, pamo_quadric *Q) {
 
     for (size_t fi = 0; fi < m->n_faces; fi++) {
         if (!m->face_alive[fi]) continue;
+        if (!pamo_mesh_face_is_valid(m, fi)) continue;
         pamo_vec3d n = pamo_face_normal(m, (int32_t)fi);
         double len = sqrt(pamo_v3_length_sq(n));
         if (len < 1e-30) continue;
@@ -60,11 +62,119 @@ static void compute_quadrics(const pamo_mesh *m, pamo_quadric *Q) {
 
 static const double COST_INF = 1e20;
 
+static bool solve_symmetric_3x3(double m[3][3], double rhs[3],
+                                pamo_vec3d *x) {
+    for (int col = 0; col < 3; col++) {
+        int pivot = col;
+        double best = fabs(m[col][col]);
+        for (int row = col + 1; row < 3; row++) {
+            double v = fabs(m[row][col]);
+            if (v > best) {
+                best = v;
+                pivot = row;
+            }
+        }
+        if (best < 1.0e-14) return false;
+        if (pivot != col) {
+            for (int k = col; k < 3; k++) {
+                double t = m[col][k];
+                m[col][k] = m[pivot][k];
+                m[pivot][k] = t;
+            }
+            double tb = rhs[col];
+            rhs[col] = rhs[pivot];
+            rhs[pivot] = tb;
+        }
+
+        double inv = 1.0 / m[col][col];
+        for (int row = col + 1; row < 3; row++) {
+            double f = m[row][col] * inv;
+            m[row][col] = 0.0;
+            for (int k = col + 1; k < 3; k++) {
+                m[row][k] -= f * m[col][k];
+            }
+            rhs[row] -= f * rhs[col];
+        }
+    }
+
+    double z = rhs[2] / m[2][2];
+    double y = (rhs[1] - m[1][2] * z) / m[1][1];
+    double xx = (rhs[0] - m[0][1] * y - m[0][2] * z) / m[0][0];
+    *x = (pamo_vec3d){xx, y, z};
+    return true;
+}
+
+static bool point_in_loose_edge_bounds(pamo_vec3d p,
+                                       pamo_vec3d a,
+                                       pamo_vec3d b) {
+    double ex = fabs(a.x - b.x);
+    double ey = fabs(a.y - b.y);
+    double ez = fabs(a.z - b.z);
+    double eps = 0.25 * sqrt(ex * ex + ey * ey + ez * ez) + 1.0e-9;
+    double lo_x = a.x < b.x ? a.x : b.x;
+    double lo_y = a.y < b.y ? a.y : b.y;
+    double lo_z = a.z < b.z ? a.z : b.z;
+    double hi_x = a.x > b.x ? a.x : b.x;
+    double hi_y = a.y > b.y ? a.y : b.y;
+    double hi_z = a.z > b.z ? a.z : b.z;
+    return p.x >= lo_x - eps && p.x <= hi_x + eps &&
+           p.y >= lo_y - eps && p.y <= hi_y + eps &&
+           p.z >= lo_z - eps && p.z <= hi_z + eps;
+}
+
+static pamo_vec3d compute_collapse_point(const pamo_mesh *m,
+                                         const pamo_quadric *Q,
+                                         int32_t u, int32_t v) {
+    pamo_vec3d pu = m->verts[u];
+    pamo_vec3d pv = m->verts[v];
+    pamo_vec3d mid = pamo_v3_scale(pamo_v3_add(pu, pv), 0.5);
+    pamo_quadric q = pamo_quadric_add(Q[u], Q[v]);
+
+    pamo_vec3d candidates[4];
+    int n_candidates = 0;
+    candidates[n_candidates++] = mid;
+    candidates[n_candidates++] = pu;
+    candidates[n_candidates++] = pv;
+
+    double a[3][3] = {
+        {q.m[0], q.m[1], q.m[2]},
+        {q.m[1], q.m[4], q.m[5]},
+        {q.m[2], q.m[5], q.m[7]},
+    };
+    double edge_len2 = pamo_v3_length_sq(pamo_v3_sub(pu, pv));
+    double lambda = 1.0e-10;
+    if (edge_len2 > 1.0) lambda *= edge_len2;
+    a[0][0] += lambda;
+    a[1][1] += lambda;
+    a[2][2] += lambda;
+    double rhs[3] = {
+        -q.m[3] + lambda * mid.x,
+        -q.m[6] + lambda * mid.y,
+        -q.m[8] + lambda * mid.z,
+    };
+    pamo_vec3d opt;
+    if (solve_symmetric_3x3(a, rhs, &opt) &&
+        point_in_loose_edge_bounds(opt, pu, pv)) {
+        candidates[n_candidates++] = opt;
+    }
+
+    pamo_vec3d best = candidates[0];
+    double best_cost = pamo_quadric_eval(&q, best);
+    for (int i = 1; i < n_candidates; i++) {
+        double cost = pamo_quadric_eval(&q, candidates[i]);
+        if (cost < best_cost) {
+            best_cost = cost;
+            best = candidates[i];
+        }
+    }
+    return best;
+}
+
 /* Check if collapsing endpoint→mid flips any adjacent normal or
  * creates a skinny triangle. Returns true if INVALID. */
 static bool collapse_creates_problem(const pamo_mesh *m,
                                      int32_t endpoint, int32_t other,
-                                     pamo_vec3d mid,
+                                     pamo_vec3d point,
                                      double skinny_thresh,
                                      double flip_threshold) {
     int32_t s = m->vert_face_offset[endpoint];
@@ -78,7 +188,7 @@ static bool collapse_creates_problem(const pamo_mesh *m,
         pamo_vec3d old_n = pamo_face_unit_normal(m, fi);
         pamo_vec3d verts[3];
         for (int k = 0; k < 3; k++)
-            verts[k] = (fv[k] == endpoint) ? mid : m->verts[fv[k]];
+            verts[k] = (fv[k] == endpoint) ? point : m->verts[fv[k]];
 
         pamo_vec3d new_n_raw = pamo_v3_cross(pamo_v3_sub(verts[1], verts[0]),
                                              pamo_v3_sub(verts[2], verts[0]));
@@ -88,6 +198,110 @@ static bool collapse_creates_problem(const pamo_mesh *m,
         if (pamo_v3_dot(old_n, new_n) < flip_threshold) return true;
         if (pamo_triangle_is_skinny(verts[0], verts[1], verts[2], skinny_thresh))
             return true;
+    }
+    return false;
+}
+
+static bool face_normal_after_collapse(const pamo_mesh *m,
+                                       int32_t fi,
+                                       int32_t u,
+                                       int32_t v,
+                                       pamo_vec3d point,
+                                       pamo_vec3d *normal_out) {
+    if (fi < 0 || (size_t)fi >= m->n_faces || !m->face_alive[fi])
+        return false;
+    const int32_t *fv = m->faces[fi].v;
+    bool has_u = (fv[0] == u || fv[1] == u || fv[2] == u);
+    bool has_v = (fv[0] == v || fv[1] == v || fv[2] == v);
+    if (has_u && has_v) return false;
+
+    pamo_vec3d verts[3];
+    for (int k = 0; k < 3; k++) {
+        verts[k] = (fv[k] == u || fv[k] == v) ? point : m->verts[fv[k]];
+    }
+
+    pamo_vec3d n = pamo_v3_cross(pamo_v3_sub(verts[1], verts[0]),
+                                 pamo_v3_sub(verts[2], verts[0]));
+    double len2 = pamo_v3_length_sq(n);
+    if (len2 <= 1e-30) return false;
+    *normal_out = pamo_v3_scale(n, 1.0 / sqrt(len2));
+    return true;
+}
+
+static bool face_has_mapped_edge(const pamo_mesh *m,
+                                 int32_t fi,
+                                 int32_t u,
+                                 int32_t v,
+                                 int32_t a,
+                                 int32_t b) {
+    if (fi < 0 || (size_t)fi >= m->n_faces || !m->face_alive[fi])
+        return false;
+    int32_t mapped[3];
+    const int32_t *fv = m->faces[fi].v;
+    bool has_u = false;
+    bool has_v = false;
+    for (int k = 0; k < 3; k++) {
+        if (fv[k] == u) has_u = true;
+        if (fv[k] == v) has_v = true;
+        mapped[k] = (fv[k] == v) ? u : fv[k];
+    }
+    if (has_u && has_v) return false;
+    bool found_a = false;
+    bool found_b = false;
+    for (int k = 0; k < 3; k++) {
+        if (mapped[k] == a) found_a = true;
+        if (mapped[k] == b) found_b = true;
+    }
+    return found_a && found_b;
+}
+
+static bool collapse_creates_fold(const pamo_mesh *m,
+                                  int32_t u,
+                                  int32_t v,
+                                  pamo_vec3d point,
+                                  double min_adjacent_dot) {
+    for (int pass = 0; pass < 2; pass++) {
+        int32_t endpoint = pass == 0 ? u : v;
+        int32_t s = m->vert_face_offset[endpoint];
+        int32_t e = m->vert_face_offset[endpoint + 1];
+        for (int32_t it = s; it < e; it++) {
+            int32_t fi = m->vert_face_list[it];
+            if (!m->face_alive[fi]) continue;
+            const int32_t *fv = m->faces[fi].v;
+            if ((fv[0] == u || fv[1] == u || fv[2] == u) &&
+                (fv[0] == v || fv[1] == v || fv[2] == v)) {
+                continue;
+            }
+
+            pamo_vec3d n0;
+            if (!face_normal_after_collapse(m, fi, u, v, point, &n0))
+                return true;
+
+            int32_t mapped[3];
+            for (int k = 0; k < 3; k++)
+                mapped[k] = (fv[k] == v) ? u : fv[k];
+
+            for (int edge = 0; edge < 3; edge++) {
+                int32_t a = mapped[edge];
+                int32_t b = mapped[(edge + 1) % 3];
+                if (a == b) return true;
+
+                int32_t scan = a;
+                if (scan < 0 || (size_t)scan >= m->n_verts) return true;
+                int32_t ns = m->vert_face_offset[scan];
+                int32_t ne = m->vert_face_offset[scan + 1];
+                for (int32_t jt = ns; jt < ne; jt++) {
+                    int32_t gj = m->vert_face_list[jt];
+                    if (gj == fi || !m->face_alive[gj]) continue;
+                    if (!face_has_mapped_edge(m, gj, u, v, a, b)) continue;
+                    pamo_vec3d n1;
+                    if (!face_normal_after_collapse(m, gj, u, v, point, &n1))
+                        continue;
+                    if (pamo_v3_dot(n0, n1) < min_adjacent_dot)
+                        return true;
+                }
+            }
+        }
     }
     return false;
 }
@@ -195,6 +409,7 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
                                 size_t edge_idx, double scale,
                                 double skinny_weight, double skinny_thresh,
                                 double flip_threshold,
+                                double fold_guard_min_dot,
                                 const bool *vert_locked) {
     pamo_edge e = m->edges[edge_idx];
     int32_t u = e.u, v = e.v;
@@ -207,17 +422,20 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
 
     pamo_vec3d pu = m->verts[u];
     pamo_vec3d pv = m->verts[v];
-    pamo_vec3d mid = pamo_v3_scale(pamo_v3_add(pu, pv), 0.5);
+    pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
+    pamo_vec3d point = compute_collapse_point(m, Q, u, v);
 
     /* Normal flip / skinny check for both endpoints. */
-    if (collapse_creates_problem(m, u, v, mid, skinny_thresh, flip_threshold))
+    if (collapse_creates_problem(m, u, v, point, skinny_thresh, flip_threshold))
         return COST_INF;
-    if (collapse_creates_problem(m, v, u, mid, skinny_thresh, flip_threshold))
+    if (collapse_creates_problem(m, v, u, point, skinny_thresh, flip_threshold))
+        return COST_INF;
+    if (fold_guard_min_dot > -1.0 &&
+        collapse_creates_fold(m, u, v, point, fold_guard_min_dot))
         return COST_INF;
 
-    /* Quadric error at midpoint. */
-    pamo_quadric Qsum = pamo_quadric_add(Q[u], Q[v]);
-    double qerr = pamo_quadric_eval(&Qsum, mid);
+    /* Quadric error at the selected collapse point. */
+    double qerr = pamo_quadric_eval(&Qsum, point);
     if (qerr < 0.0) qerr = 0.0;
     double s2 = scale * scale;
     if (s2 > 1e-30) qerr /= s2;
@@ -243,7 +461,7 @@ static double compute_edge_cost(const pamo_mesh *m, const pamo_quadric *Q,
             if (fv[0] == other || fv[1] == other || fv[2] == other) continue;
             pamo_vec3d verts[3];
             for (int k = 0; k < 3; k++)
-                verts[k] = (fv[k] == endpoint) ? mid : m->verts[fv[k]];
+                verts[k] = (fv[k] == endpoint) ? point : m->verts[fv[k]];
             double q = pamo_triangle_quality(verts[0], verts[1], verts[2]);
             if (q > 1.0) q = 1.0;
             skinny_sum += 1.0 - q;
@@ -373,6 +591,7 @@ static pamo_error simplify_round(pamo_mesh *m,
                                      opts->skinny_penalty_weight,
                                      opts->skinny_area_threshold,
                                      flip_thresh,
+                                     opts->fold_guard_min_dot,
                                      vert_locked);
         if (c < cost_limit) {
             costs[n_valid].cost = c;
@@ -384,13 +603,22 @@ static pamo_error simplify_round(pamo_mesh *m,
     pamo_sort_edge_costs(costs, n_valid);
 
     /* Greedy selection. */
-    bool *locked = PAMO_ALLOC_ARRAY(alloc, bool, m->n_verts);
-    if (!locked) goto cleanup;
-
+    bool *locked = NULL;
+    pamo_collapse_record *records = NULL;
     size_t records_cap = n_valid > 0 ? n_valid : 1;
-    pamo_collapse_record *records = PAMO_ALLOC_ARRAY(alloc, pamo_collapse_record,
-                                                     records_cap);
-    if (!records) goto cleanup;
+
+    locked = PAMO_ALLOC_ARRAY(alloc, bool, m->n_verts);
+    if (!locked) {
+        err = PAMO_ERR_ALLOC;
+        goto cleanup;
+    }
+    memset(locked, 0, m->n_verts * sizeof(bool));
+
+    records = PAMO_ALLOC_ARRAY(alloc, pamo_collapse_record, records_cap);
+    if (!records) {
+        err = PAMO_ERR_ALLOC;
+        goto cleanup;
+    }
 
     size_t n_accepted = 0;
     for (size_t i = 0; i < n_valid; i++) {
@@ -499,27 +727,38 @@ static pamo_error simplify_round(pamo_mesh *m,
 
         if (!safe) continue;
 
-        pamo_vec3d mid = pamo_v3_scale(
-            pamo_v3_add(m->verts[u], m->verts[v]), 0.5);
-        apply_collapse(m, u, v, mid);
+        pamo_vec3d point = compute_collapse_point(m, Q, u, v);
+        if (collapse_creates_problem(m, u, v, point,
+                                     opts->skinny_area_threshold, 0.0) ||
+            collapse_creates_problem(m, v, u, point,
+                                     opts->skinny_area_threshold, 0.0) ||
+            (opts->fold_guard_min_dot > -1.0 &&
+             collapse_creates_fold(m, u, v, point,
+                                   opts->fold_guard_min_dot))) {
+            continue;
+        }
+        apply_collapse(m, u, v, point);
         actually_collapsed++;
     }
 
     *n_collapsed_out = actually_collapsed;
 
-    PAMO_FREE_ARRAY(alloc, records, pamo_collapse_record, records_cap);
 cleanup:
+    if (records) PAMO_FREE_ARRAY(alloc, records, pamo_collapse_record, records_cap);
     if (locked) PAMO_FREE_ARRAY(alloc, locked, bool, m->n_verts);
     PAMO_FREE_ARRAY(alloc, costs, pamo_edge_cost_entry, m->n_edges);
     PAMO_FREE_ARRAY(alloc, Q, pamo_quadric, m->n_verts);
     pamo_mesh_free_adjacency(m);
-    return PAMO_OK;
+    return err;
 }
 
 /* ── Main simplification driver ──────────────────────────────────── */
 
 pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
     if (!mesh || !opts) return PAMO_ERR_INVALID_ARG;
+
+    pamo_error err = pamo_mesh_compact(mesh);
+    if (err != PAMO_OK) return err;
 
     int32_t stuck_counter = 0;
     double cost_limit = opts->cost_range;
@@ -539,8 +778,7 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
         size_t n_collapsed = 0;
         bool relax = (stuck_counter >= 2); /* relax normals when deeply stuck */
-        pamo_error err = simplify_round(mesh, opts, NULL,
-                                        cost_limit, relax, &n_collapsed);
+        err = simplify_round(mesh, opts, NULL, cost_limit, relax, &n_collapsed);
         if (err != PAMO_OK) return err;
 
         err = pamo_mesh_compact(mesh);

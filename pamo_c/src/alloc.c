@@ -93,21 +93,6 @@ static size_t record_remove(pamo_tracking_ctx *t, void *ptr) {
     return 0; /* not found */
 }
 
-static void record_update(pamo_tracking_ctx *t, void *old_ptr,
-                          void *new_ptr, size_t new_size) {
-    pamo_alloc_record *r = t->live;
-    while (r) {
-        if (r->ptr == old_ptr) {
-            r->ptr  = new_ptr;
-            r->size = new_size;
-            return;
-        }
-        r = r->next;
-    }
-    /* old_ptr not found -- treat as new alloc. */
-    record_add(t, new_ptr, new_size);
-}
-
 static void *tracking_alloc(size_t size, void *ctx) {
     pamo_tracking_ctx *t = (pamo_tracking_ctx *)ctx;
     if (size == 0) return NULL;
@@ -142,16 +127,23 @@ static void *tracking_realloc(void *ptr, size_t old_size, size_t new_size,
     size_t actual_old = 0;
     pamo_alloc_record *r = t->live;
     while (r) {
-        if (r->ptr == ptr) { actual_old = r->size; break; }
+        if (r->ptr == ptr) {
+            actual_old = r->size;
+            break;
+        }
         r = r->next;
     }
-    void *old_ptr = ptr;
     void *p = realloc(ptr, new_size);
     if (!p) return NULL;
     if (new_size > actual_old) {
         memset((char *)p + actual_old, 0, new_size - actual_old);
     }
-    record_update(t, old_ptr, p, new_size);
+    if (r) {
+        r->ptr = p;
+        r->size = new_size;
+    } else {
+        record_add(t, p, new_size);
+    }
     if (new_size > actual_old) {
         t->total_allocated += (new_size - actual_old);
         t->current += (new_size - actual_old);

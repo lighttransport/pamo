@@ -6,9 +6,17 @@
  */
 #include "pamo/pamo.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 
 /* TODO: Integrate tinyobj_loader_c.h for full OBJ support.
  * For now, a minimal OBJ reader/writer. */
@@ -94,14 +102,42 @@ static pamo_error save_obj(const char *path, const pamo_mesh *m) {
     return PAMO_OK;
 }
 
+static int ensure_dir(const char *path) {
+    if (!path || !path[0]) return 0;
+#if defined(_WIN32)
+    if (_mkdir(path) == 0) return 1;
+#else
+    if (mkdir(path, 0777) == 0) return 1;
+#endif
+    return errno == EEXIST;
+}
+
+static pamo_error save_stage_obj(const char *dir, const char *name,
+                                 const pamo_mesh *m) {
+    if (!dir || !dir[0]) return PAMO_OK;
+    if (!ensure_dir(dir)) {
+        fprintf(stderr, "Error: cannot create stage output dir %s\n", dir);
+        return PAMO_ERR_IO;
+    }
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s/%s.obj", dir, name);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "Error: stage output path is too long\n");
+        return PAMO_ERR_IO;
+    }
+    return save_obj(path, m);
+}
+
 static void usage(const char *prog) {
     fprintf(stderr, "Usage: %s --input <in.obj> --output <out.obj> "
-            "--ratio <0.001> [--disable_stage1] [--disable_stage3]\n", prog);
+            "--ratio <0.001> [--disable_stage1] [--disable_stage3] "
+            "[--stage-output-dir <dir>]\n", prog);
 }
 
 int main(int argc, char **argv) {
     const char *input_path = NULL;
     const char *output_path = NULL;
+    const char *stage_output_dir = NULL;
     double ratio = 0.1;
     bool stage1 = true;
     bool stage3 = true;
@@ -113,6 +149,8 @@ int main(int argc, char **argv) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--ratio") == 0 && i + 1 < argc) {
             ratio = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--stage-output-dir") == 0 && i + 1 < argc) {
+            stage_output_dir = argv[++i];
         } else if (strcmp(argv[i], "--disable_stage1") == 0) {
             stage1 = false;
         } else if (strcmp(argv[i], "--disable_stage3") == 0) {
@@ -143,6 +181,14 @@ int main(int argc, char **argv) {
     printf("Stage1 : %s\n", stage1 ? "True" : "False");
     printf("Stage3 : %s\n", stage3 ? "True" : "False");
 
+    err = save_stage_obj(stage_output_dir, "00_input", &mesh);
+    if (err != PAMO_OK) {
+        fprintf(stderr, "Error saving stage input: %s\n",
+                pamo_error_string(err));
+        pamo_mesh_destroy(&mesh);
+        return 1;
+    }
+
     /* Stage 1: Remeshing */
     if (stage1) {
         pamo_remesh_opts ropts = pamo_remesh_opts_default();
@@ -160,6 +206,13 @@ int main(int argc, char **argv) {
             mesh = remeshed;
             fprintf(stderr, "Stage 1: %zu verts, %zu faces\n",
                     mesh.n_verts, mesh.n_faces);
+            err = save_stage_obj(stage_output_dir, "01_remesh", &mesh);
+            if (err != PAMO_OK) {
+                fprintf(stderr, "Error saving stage remesh: %s\n",
+                        pamo_error_string(err));
+                pamo_mesh_destroy(&mesh);
+                return 1;
+            }
         } else {
             fprintf(stderr, "Stage 1 failed (%s), using original mesh.\n",
                     pamo_error_string(err));
@@ -180,6 +233,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Simplification error: %s\n",
                     pamo_error_string(err));
         }
+        err = save_stage_obj(stage_output_dir, "02_simplify", &mesh);
+        if (err != PAMO_OK) {
+            fprintf(stderr, "Error saving stage simplify: %s\n",
+                    pamo_error_string(err));
+            pamo_mesh_destroy(&mesh);
+            return 1;
+        }
     }
 
     /* Stage 3: SAFE Projection */
@@ -194,9 +254,26 @@ int main(int argc, char **argv) {
             if (err != PAMO_OK) {
                 fprintf(stderr, "Stage 3 error: %s\n",
                         pamo_error_string(err));
+            } else {
+                err = save_stage_obj(stage_output_dir, "03_project", &mesh);
+                if (err != PAMO_OK) {
+                    fprintf(stderr, "Error saving stage project: %s\n",
+                            pamo_error_string(err));
+                    pamo_mesh_destroy(&gt_mesh);
+                    pamo_mesh_destroy(&mesh);
+                    return 1;
+                }
             }
             pamo_mesh_destroy(&gt_mesh);
         }
+    }
+
+    err = save_stage_obj(stage_output_dir, "04_output", &mesh);
+    if (err != PAMO_OK) {
+        fprintf(stderr, "Error saving stage output: %s\n",
+                pamo_error_string(err));
+        pamo_mesh_destroy(&mesh);
+        return 1;
     }
 
     err = save_obj(output_path, &mesh);

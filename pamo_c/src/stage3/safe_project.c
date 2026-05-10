@@ -123,8 +123,23 @@ pamo_error pamo_safe_project(pamo_mesh *mesh, const pamo_mesh *gt_mesh,
                              const pamo_safe_opts *opts,
                              const pamo_allocator *alloc) {
     if (!mesh || !gt_mesh || !opts || !alloc) return PAMO_ERR_INVALID_ARG;
+    if (!mesh->verts || !mesh->faces || !mesh->vert_alive ||
+        !mesh->face_alive) {
+        return PAMO_ERR_INVALID_ARG;
+    }
+    if (mesh->n_verts == 0 || mesh->n_faces == 0)
+        return PAMO_ERR_INVALID_ARG;
+    for (size_t fi = 0; fi < mesh->n_faces; fi++) {
+        if (mesh->face_alive[fi] && !pamo_mesh_face_is_valid(mesh, fi))
+            return PAMO_ERR_INVALID_ARG;
+    }
 
     size_t n = mesh->n_verts;
+    if (n > SIZE_MAX / 3u ||
+        n * 3u > SIZE_MAX / sizeof(double) ||
+        mesh->n_faces > SIZE_MAX / sizeof(pamo_elastic_rest)) {
+        return PAMO_ERR_INVALID_ARG;
+    }
     size_t dim = n * 3;
 
     pamo_safe_ctx ctx;

@@ -137,11 +137,18 @@ pamo_error pamo_bvh_build_triangles(pamo_bvh *bvh,
 
     memset(bvh, 0, sizeof(*bvh));
     bvh->alloc = *alloc;
+    if (m->n_faces > (size_t)INT32_MAX) return PAMO_ERR_INVALID_ARG;
+    if ((m->n_faces > 0 && (!m->faces || !m->face_alive)) ||
+        (m->n_verts > 0 && (!m->verts || !m->vert_alive))) {
+        return PAMO_ERR_INVALID_ARG;
+    }
 
     /* Count alive faces. */
     size_t n_alive = 0;
     for (size_t i = 0; i < m->n_faces; i++) {
-        if (m->face_alive[i]) n_alive++;
+        if (!m->face_alive[i]) continue;
+        if (!pamo_mesh_face_is_valid(m, i)) return PAMO_ERR_INVALID_ARG;
+        n_alive++;
     }
     if (n_alive == 0) {
         bvh->n_prims = 0;
@@ -149,6 +156,8 @@ pamo_error pamo_bvh_build_triangles(pamo_bvh *bvh,
         bvh->nodes = NULL;
         return PAMO_OK;
     }
+    if (n_alive > ((size_t)INT32_MAX + 1u) / 2u)
+        return PAMO_ERR_INVALID_ARG;
 
     /* Build primitives array. */
     pamo_bvh_prim *prims = PAMO_ALLOC_ARRAY(alloc, pamo_bvh_prim, n_alive);
@@ -207,6 +216,7 @@ static void nearest_recurse(const pamo_bvh *bvh, const pamo_mesh *m,
                             pamo_vec3d query, int32_t node_idx,
                             pamo_nearest_result *best) {
     if (node_idx < 0) return;
+    if ((size_t)node_idx >= bvh->n_nodes) return;
     const pamo_bvh_node *node = &bvh->nodes[node_idx];
 
     double box_dist = aabb_min_dist_sq(node->box, query);
@@ -215,6 +225,7 @@ static void nearest_recurse(const pamo_bvh *bvh, const pamo_mesh *m,
     if (node->left < 0 && node->right < 0) {
         /* Leaf. */
         int32_t fi = node->prim_id;
+        if (fi < 0 || !pamo_mesh_face_is_valid(m, (size_t)fi)) return;
         pamo_vec3d v0 = m->verts[m->faces[fi].v[0]];
         pamo_vec3d v1 = m->verts[m->faces[fi].v[1]];
         pamo_vec3d v2 = m->verts[m->faces[fi].v[2]];
@@ -229,6 +240,11 @@ static void nearest_recurse(const pamo_bvh *bvh, const pamo_mesh *m,
     }
 
     /* Visit nearer child first. */
+    if (node->left < 0 || node->right < 0 ||
+        (size_t)node->left >= bvh->n_nodes ||
+        (size_t)node->right >= bvh->n_nodes) {
+        return;
+    }
     double d_left  = aabb_min_dist_sq(bvh->nodes[node->left].box, query);
     double d_right = aabb_min_dist_sq(bvh->nodes[node->right].box, query);
     if (d_left <= d_right) {
@@ -294,6 +310,7 @@ static pamo_error overlap_recurse(const pamo_bvh *bvh,
                                   int32_t node_idx,
                                   pamo_overlap_result *result) {
     if (node_idx < 0) return PAMO_OK;
+    if ((size_t)node_idx >= bvh->n_nodes) return PAMO_ERR_INVALID_ARG;
     const pamo_bvh_node *node = &bvh->nodes[node_idx];
 
     if (!aabb_overlaps(node->box, query_box)) return PAMO_OK;

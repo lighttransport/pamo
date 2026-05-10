@@ -8,6 +8,10 @@
 
 pamo_error pamo_mesh_compact(pamo_mesh *m) {
     if (!m) return PAMO_ERR_INVALID_ARG;
+    if ((m->n_faces > 0 && (!m->faces || !m->face_alive)) ||
+        (m->n_verts > 0 && (!m->verts || !m->vert_alive))) {
+        return PAMO_ERR_INVALID_ARG;
+    }
     pamo_allocator *a = &m->alloc;
 
     /* Free adjacency since it will be invalid after compaction. */
@@ -17,13 +21,21 @@ pamo_error pamo_mesh_compact(pamo_mesh *m) {
     size_t old_nf = m->n_faces;
 
     /* ── 1. Compact faces, removing dead/degenerate ones ─────────── */
-    int32_t new_nf = 0;
+    size_t new_nf = 0;
     for (size_t i = 0; i < old_nf; i++) {
         if (!m->face_alive[i]) continue;
         pamo_tri f = m->faces[i];
-        /* Skip faces with dead vertices. */
-        if (!m->vert_alive[f.v[0]] || !m->vert_alive[f.v[1]] ||
-            !m->vert_alive[f.v[2]]) continue;
+        /* Skip faces with invalid or dead vertices. This keeps compaction
+         * usable as a repair step after an interrupted/failed collapse. */
+        bool valid = true;
+        for (int k = 0; k < 3; k++) {
+            if (f.v[k] < 0 || (size_t)f.v[k] >= old_nv ||
+                !m->vert_alive[f.v[k]]) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) continue;
         /* Skip degenerate. */
         if (f.v[0] == f.v[1] || f.v[1] == f.v[2] || f.v[2] == f.v[0])
             continue;
@@ -38,7 +50,7 @@ pamo_error pamo_mesh_compact(pamo_mesh *m) {
 
     /* ── 2. Mark unreferenced vertices as dead ───────────────────── */
     for (size_t i = 0; i < old_nv; i++) m->vert_alive[i] = false;
-    for (int32_t i = 0; i < new_nf; i++) {
+    for (size_t i = 0; i < new_nf; i++) {
         m->vert_alive[m->faces[i].v[0]] = true;
         m->vert_alive[m->faces[i].v[1]] = true;
         m->vert_alive[m->faces[i].v[2]] = true;
@@ -49,10 +61,14 @@ pamo_error pamo_mesh_compact(pamo_mesh *m) {
     int32_t *vert_map = PAMO_ALLOC_ARRAY(a, int32_t, map_alloc);
     if (!vert_map && old_nv > 0) return PAMO_ERR_ALLOC;
 
-    int32_t new_nv = 0;
+    size_t new_nv = 0;
+    if (old_nv > (size_t)INT32_MAX) {
+        PAMO_FREE_ARRAY(a, vert_map, int32_t, map_alloc);
+        return PAMO_ERR_INVALID_ARG;
+    }
     for (size_t i = 0; i < old_nv; i++) {
         if (m->vert_alive[i]) {
-            vert_map[i] = new_nv;
+            vert_map[i] = (int32_t)new_nv;
             m->verts[new_nv] = m->verts[i];
             m->vert_alive[new_nv] = true;
             new_nv++;
@@ -66,7 +82,7 @@ pamo_error pamo_mesh_compact(pamo_mesh *m) {
     m->n_verts = (size_t)new_nv;
 
     /* ── 4. Remap face indices ───────────────────────────────────── */
-    for (int32_t i = 0; i < new_nf; i++) {
+    for (size_t i = 0; i < new_nf; i++) {
         m->faces[i].v[0] = vert_map[m->faces[i].v[0]];
         m->faces[i].v[1] = vert_map[m->faces[i].v[1]];
         m->faces[i].v[2] = vert_map[m->faces[i].v[2]];

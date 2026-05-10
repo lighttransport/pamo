@@ -54,10 +54,13 @@ class PaMO(nn.Module):
         # vol2mesh params
         self.vol2mesh = DMC(dtype=torch.float32).cuda()
         # mesh2vol params
-        self.R = 256
+        self.set_remesh_resolution(256)
+        self.target_faces = None
+
+    def set_remesh_resolution(self, resolution):
+        self.R = int(resolution)
         self.band = 3 / self.R # 3
         self.margin = self.band * 2 + 1 #2
-        self.target_faces = None
 
     def tri_area(self, v0, v1, v2):
         cross_prod = torch.cross(v1 - v0, v2 - v0)
@@ -99,10 +102,25 @@ class PaMO(nn.Module):
         
         return v, f
 
-    def run(self, points, triangles, ratio, tolerance=4, threshold=1e-3, iter=1000000, min_verts=10000000000):
-        
-        self.target_faces = max(int(ratio * len(triangles)), min_verts)
-        print("Target faces : {}".format(self.target_faces))
+    def run(self, points, triangles, ratio, tolerance=4, threshold=1e-3,
+            iter=1000000, min_verts=10000000000, stage_callback=None,
+            target_faces=None, remesh_resolution=None):
+
+        initial_target_faces = max(int(ratio * len(triangles)), min_verts)
+        if target_faces is not None:
+            initial_target_faces = max(int(target_faces), min_verts)
+        self.target_faces = initial_target_faces
+        print("Initial target faces : {}".format(self.target_faces))
+
+        if self.use_stage1:
+            if remesh_resolution is not None:
+                self.set_remesh_resolution(remesh_resolution)
+            else:
+                # Default 256
+                if self.target_faces <= 1000:
+                    self.set_remesh_resolution(128)
+                if self.target_faces <= 50:
+                    self.set_remesh_resolution(64)
 
         # scale the input mesh
         tris, tris_min, tris_max, tris_mean = self.preprocess_mesh(points, triangles, self.band, self.margin)
@@ -110,19 +128,19 @@ class PaMO(nn.Module):
 
         # stage1 (Remeshing)
         if self.use_stage1:
-            # Default 256
-            if self.target_faces <= 1000:
-                self.R = 128
-            if self.target_faces <= 50:
-                self.R = 64
-
             start_stage1 = time.time()
             verts, faces = self.remesh(tris, tris_min, tris_max, tris_mean)
             end_stage1 = time.time()
             print(f"Time for Remeshing: {end_stage1 - start_stage1} sec")
+            if stage_callback is not None:
+                stage_callback("01_remesh", verts, faces)
+            if target_faces is None:
+                self.target_faces = max(int(ratio * len(faces)), min_verts)
+                print("Target faces : {}".format(self.target_faces))
         else:
             verts = points - torch.from_numpy(tris_mean).to(points.device)
             faces = triangles
+            print("Target faces : {}".format(self.target_faces))
 
         # stage2 (Simplification)
         start_stage2 =time.time()
@@ -168,6 +186,8 @@ class PaMO(nn.Module):
         verts = verts.cpu().numpy()+ tris_mean
         faces = faces.cpu().numpy()
         print(f"Time for Simplification: {end_stage2 - start_stage2} sec")
+        if stage_callback is not None:
+            stage_callback("02_simplify", verts, faces)
         
         # stage3 (Safe projection)
         if self.use_stage3 == True:
@@ -204,6 +224,8 @@ class PaMO(nn.Module):
                 system=self.system,  # if provided, reuse the same system to avoid memory allocation
                 config=self.config,  # if system is not provided, use this config to create a new system
             )
+            if stage_callback is not None:
+                stage_callback("03_project", verts, faces)
             
         return verts, faces
 

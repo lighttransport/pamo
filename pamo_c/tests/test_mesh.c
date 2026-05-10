@@ -7,6 +7,44 @@
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+static void *poison_alloc(size_t size, void *ctx) {
+    (void)ctx;
+    if (size == 0) return NULL;
+    void *p = malloc(size);
+    if (p) memset(p, 0x7f, size);
+    return p;
+}
+
+static void *poison_realloc(void *ptr, size_t old_size, size_t new_size,
+                            void *ctx) {
+    (void)ctx;
+    if (new_size == 0) {
+        free(ptr);
+        return NULL;
+    }
+    void *p = realloc(ptr, new_size);
+    if (p && new_size > old_size)
+        memset((char *)p + old_size, 0x7f, new_size - old_size);
+    return p;
+}
+
+static void poison_free(void *ptr, size_t size, void *ctx) {
+    (void)size;
+    (void)ctx;
+    free(ptr);
+}
+
+static pamo_allocator poison_allocator(void) {
+    return (pamo_allocator){
+        .alloc = poison_alloc,
+        .realloc = poison_realloc,
+        .free = poison_free,
+        .ctx = NULL,
+    };
+}
 
 /* Helper: create a single-triangle mesh. */
 static void make_single_triangle(pamo_mesh *m, pamo_allocator *a) {
@@ -131,6 +169,27 @@ static void test_adjacency(void) {
     printf("  adjacency: PASS\n");
 }
 
+static void test_adjacency_with_nonzero_allocator(void) {
+    pamo_allocator a = poison_allocator();
+    pamo_mesh m;
+    make_tetrahedron(&m, &a);
+
+    pamo_error err = pamo_mesh_build_adjacency(&m);
+    assert(err == PAMO_OK);
+    assert(m.n_edges == 6);
+    for (int i = 0; i < 4; i++) {
+        int32_t cnt = m.vert_face_offset[i + 1] - m.vert_face_offset[i];
+        assert(cnt == 3);
+    }
+    for (size_t i = 0; i < m.n_edges; i++) {
+        int32_t cnt = m.edge_face_offset[i + 1] - m.edge_face_offset[i];
+        assert(cnt == 2);
+    }
+
+    pamo_mesh_destroy(&m);
+    printf("  adjacency_with_nonzero_allocator: PASS\n");
+}
+
 static void test_compact(void) {
     pamo_allocator a = pamo_tracking_allocator_create();
     pamo_mesh m;
@@ -154,6 +213,55 @@ static void test_compact(void) {
     assert(!pamo_tracking_allocator_has_leaks(&a));
     pamo_tracking_allocator_destroy(&a);
     printf("  compact: PASS\n");
+}
+
+static void test_compact_drops_invalid_faces(void) {
+    pamo_allocator a = pamo_tracking_allocator_create();
+    pamo_mesh m;
+    pamo_error err = pamo_mesh_create(&m, 3, 3, &a);
+    assert(err == PAMO_OK);
+    m.verts[0] = (pamo_vec3d){0.0, 0.0, 0.0};
+    m.verts[1] = (pamo_vec3d){1.0, 0.0, 0.0};
+    m.verts[2] = (pamo_vec3d){0.0, 1.0, 0.0};
+    m.faces[0] = (pamo_tri){{0, 1, 2}};
+    m.faces[1] = (pamo_tri){{0, 2, 8}};  /* out-of-range */
+    m.faces[2] = (pamo_tri){{1, 1, 2}};  /* degenerate */
+
+    err = pamo_mesh_compact(&m);
+    assert(err == PAMO_OK);
+    assert(m.n_verts == 3);
+    assert(m.n_faces == 1);
+    assert(m.faces[0].v[0] == 0);
+    assert(m.faces[0].v[1] == 1);
+    assert(m.faces[0].v[2] == 2);
+
+    pamo_mesh_destroy(&m);
+    assert(!pamo_tracking_allocator_has_leaks(&a));
+    pamo_tracking_allocator_destroy(&a);
+    printf("  compact_drops_invalid_faces: PASS\n");
+}
+
+static void test_adjacency_rejects_invalid_faces(void) {
+    pamo_allocator a = pamo_tracking_allocator_create();
+    pamo_mesh m;
+    pamo_error err = pamo_mesh_create(&m, 3, 1, &a);
+    assert(err == PAMO_OK);
+    m.verts[0] = (pamo_vec3d){0.0, 0.0, 0.0};
+    m.verts[1] = (pamo_vec3d){1.0, 0.0, 0.0};
+    m.verts[2] = (pamo_vec3d){0.0, 1.0, 0.0};
+    m.faces[0] = (pamo_tri){{0, 1, 9}};
+
+    err = pamo_mesh_build_adjacency(&m);
+    assert(err == PAMO_ERR_INVALID_ARG);
+    assert(m.vert_face_offset == NULL);
+    assert(m.vert_face_list == NULL);
+    assert(m.edge_face_offset == NULL);
+    assert(m.edge_face_list == NULL);
+
+    pamo_mesh_destroy(&m);
+    assert(!pamo_tracking_allocator_has_leaks(&a));
+    pamo_tracking_allocator_destroy(&a);
+    printf("  adjacency_rejects_invalid_faces: PASS\n");
 }
 
 static void test_shared_neighbors(void) {
@@ -213,7 +321,10 @@ int main(void) {
     test_geometry();
     test_closest_point();
     test_adjacency();
+    test_adjacency_with_nonzero_allocator();
     test_compact();
+    test_compact_drops_invalid_faces();
+    test_adjacency_rejects_invalid_faces();
     test_shared_neighbors();
     test_quadric();
     test_triangle_quality();

@@ -9,7 +9,8 @@
 /* ── Face geometry ───────────────────────────────────────────────── */
 
 pamo_vec3d pamo_face_normal(const pamo_mesh *m, int32_t face_id) {
-    PAMO_ASSERT(m && face_id >= 0 && (size_t)face_id < m->n_faces);
+    if (!m || face_id < 0 || !pamo_mesh_face_is_valid(m, (size_t)face_id))
+        return pamo_v3_zero();
     const pamo_tri *f = &m->faces[face_id];
     pamo_vec3d v0 = m->verts[f->v[0]];
     pamo_vec3d v1 = m->verts[f->v[1]];

@@ -63,6 +63,10 @@ size_t pamo_mesh_count_alive_faces(const pamo_mesh *m);
 /* Count currently alive vertices. */
 size_t pamo_mesh_count_alive_verts(const pamo_mesh *m);
 
+/* Return true when a face exists, is alive, has three distinct vertices,
+ * and every vertex index is inside the mesh vertex array and alive. */
+bool pamo_mesh_face_is_valid(const pamo_mesh *m, size_t face_id);
+
 /* ── Geometry utilities ──────────────────────────────────────────── */
 
 /* Compute face normal (unnormalized: magnitude = 2 * area). */

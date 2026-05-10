@@ -30,6 +30,8 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
 typedef struct {
     int32_t resolution;   /* SDF grid resolution (default 256) */
     double  band;         /* SDF band width (default 3.0/resolution) */
+    int32_t topology_closing_voxels; /* binary SDF closing radius before DMC
+                                      * (0 = off; useful for open polygon soups) */
 } pamo_remesh_opts;
 
 pamo_remesh_opts pamo_remesh_opts_default(void);

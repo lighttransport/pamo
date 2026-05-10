@@ -31,17 +31,27 @@ pamo_error pamo_mesh_build_adjacency(pamo_mesh *m) {
 
     size_t nv = m->n_verts;
     size_t nf = m->n_faces;
+    if (nv > (size_t)INT32_MAX || nf > (size_t)INT32_MAX)
+        return PAMO_ERR_INVALID_ARG;
+    if ((nf > 0 && (!m->faces || !m->face_alive)) ||
+        (nv > 0 && (!m->verts || !m->vert_alive))) {
+        return PAMO_ERR_INVALID_ARG;
+    }
 
     /* ── 1. Vertex->face CSR ─────────────────────────────────────── */
     m->vert_face_offset = PAMO_ALLOC_ARRAY(a, int32_t, nv + 1);
     if (!m->vert_face_offset) return PAMO_ERR_ALLOC;
+    memset(m->vert_face_offset, 0, (nv + 1) * sizeof(int32_t));
 
     /* Count faces per vertex. */
     for (size_t fi = 0; fi < nf; fi++) {
         if (!m->face_alive[fi]) continue;
+        if (!pamo_mesh_face_is_valid(m, fi)) {
+            pamo_mesh_free_adjacency(m);
+            return PAMO_ERR_INVALID_ARG;
+        }
         for (int k = 0; k < 3; k++) {
             int32_t vi = m->faces[fi].v[k];
-            PAMO_ASSERT(vi >= 0 && (size_t)vi < nv);
             m->vert_face_offset[vi]++;
         }
     }
@@ -59,12 +69,18 @@ pamo_error pamo_mesh_build_adjacency(pamo_mesh *m) {
 
     size_t total_valence = (size_t)m->vert_face_offset[nv];
     m->vert_face_list = PAMO_ALLOC_ARRAY(a, int32_t, total_valence > 0 ? total_valence : 1);
-    if (!m->vert_face_list && total_valence > 0) return PAMO_ERR_ALLOC;
+    if (!m->vert_face_list && total_valence > 0) {
+        pamo_mesh_free_adjacency(m);
+        return PAMO_ERR_ALLOC;
+    }
 
     /* Temporary write cursors. */
     int32_t *cursor = PAMO_ALLOC_ARRAY(a, int32_t, nv);
-    if (!cursor && nv > 0) return PAMO_ERR_ALLOC;
-    memcpy(cursor, m->vert_face_offset, nv * sizeof(int32_t));
+    if (!cursor && nv > 0) {
+        pamo_mesh_free_adjacency(m);
+        return PAMO_ERR_ALLOC;
+    }
+    if (nv > 0) memcpy(cursor, m->vert_face_offset, nv * sizeof(int32_t));
 
     for (size_t fi = 0; fi < nf; fi++) {
         if (!m->face_alive[fi]) continue;
@@ -82,10 +98,17 @@ pamo_error pamo_mesh_build_adjacency(pamo_mesh *m) {
     for (size_t fi = 0; fi < nf; fi++) {
         if (m->face_alive[fi]) n_half += 3;
     }
+    if (n_half > (size_t)INT32_MAX) {
+        pamo_mesh_free_adjacency(m);
+        return PAMO_ERR_INVALID_ARG;
+    }
 
     pamo_edge *half_edges = PAMO_ALLOC_ARRAY(a, pamo_edge,
                                              n_half > 0 ? n_half : 1);
-    if (!half_edges && n_half > 0) return PAMO_ERR_ALLOC;
+    if (!half_edges && n_half > 0) {
+        pamo_mesh_free_adjacency(m);
+        return PAMO_ERR_ALLOC;
+    }
 
     size_t ei = 0;
     for (size_t fi = 0; fi < nf; fi++) {
@@ -112,6 +135,7 @@ pamo_error pamo_mesh_build_adjacency(pamo_mesh *m) {
     m->edges = PAMO_ALLOC_ARRAY(a, pamo_edge, n_unique > 0 ? n_unique : 1);
     if (!m->edges && n_unique > 0) {
         PAMO_FREE_ARRAY(a, half_edges, pamo_edge, n_half > 0 ? n_half : 1);
+        pamo_mesh_free_adjacency(m);
         return PAMO_ERR_ALLOC;
     }
 
@@ -127,7 +151,11 @@ pamo_error pamo_mesh_build_adjacency(pamo_mesh *m) {
 
     /* ── 3. Edge->face CSR ───────────────────────────────────────── */
     m->edge_face_offset = PAMO_ALLOC_ARRAY(a, int32_t, n_unique + 1);
-    if (!m->edge_face_offset && n_unique > 0) return PAMO_ERR_ALLOC;
+    if (!m->edge_face_offset) {
+        pamo_mesh_free_adjacency(m);
+        return PAMO_ERR_ALLOC;
+    }
+    memset(m->edge_face_offset, 0, (n_unique + 1) * sizeof(int32_t));
 
     /* For each alive face, find its 3 edges in the sorted edge list
      * and count.  Use binary search. */
@@ -145,8 +173,11 @@ pamo_error pamo_mesh_build_adjacency(pamo_mesh *m) {
                 if (edge_cmp(&m->edges[mid], &key) < 0) lo = mid + 1;
                 else hi = mid;
             }
-            PAMO_ASSERT(lo < n_unique &&
-                        m->edges[lo].u == u && m->edges[lo].v == v);
+            if (lo >= n_unique || m->edges[lo].u != u ||
+                m->edges[lo].v != v) {
+                pamo_mesh_free_adjacency(m);
+                return PAMO_ERR_INVALID_ARG;
+            }
             m->edge_face_offset[lo]++;
         }
     }
@@ -164,12 +195,20 @@ pamo_error pamo_mesh_build_adjacency(pamo_mesh *m) {
 
     size_t total_ef = (size_t)m->edge_face_offset[n_unique];
     m->edge_face_list = PAMO_ALLOC_ARRAY(a, int32_t, total_ef > 0 ? total_ef : 1);
-    if (!m->edge_face_list && total_ef > 0) return PAMO_ERR_ALLOC;
+    if (!m->edge_face_list && total_ef > 0) {
+        pamo_mesh_free_adjacency(m);
+        return PAMO_ERR_ALLOC;
+    }
 
     int32_t *ef_cursor = PAMO_ALLOC_ARRAY(a, int32_t, n_unique > 0 ? n_unique : 1);
-    if (!ef_cursor && n_unique > 0) return PAMO_ERR_ALLOC;
-    memcpy(ef_cursor, m->edge_face_offset,
-           n_unique * sizeof(int32_t));
+    if (!ef_cursor && n_unique > 0) {
+        pamo_mesh_free_adjacency(m);
+        return PAMO_ERR_ALLOC;
+    }
+    if (n_unique > 0) {
+        memcpy(ef_cursor, m->edge_face_offset,
+               n_unique * sizeof(int32_t));
+    }
 
     for (size_t fi = 0; fi < nf; fi++) {
         if (!m->face_alive[fi]) continue;
@@ -183,6 +222,13 @@ pamo_error pamo_mesh_build_adjacency(pamo_mesh *m) {
                 size_t mid = lo + (hi - lo) / 2;
                 if (edge_cmp(&m->edges[mid], &key) < 0) lo = mid + 1;
                 else hi = mid;
+            }
+            if (lo >= n_unique || m->edges[lo].u != u ||
+                m->edges[lo].v != v) {
+                PAMO_FREE_ARRAY(a, ef_cursor, int32_t,
+                                n_unique > 0 ? n_unique : 1);
+                pamo_mesh_free_adjacency(m);
+                return PAMO_ERR_INVALID_ARG;
             }
             m->edge_face_list[ef_cursor[lo]++] = (int32_t)fi;
         }

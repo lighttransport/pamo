@@ -37,6 +37,38 @@ pamo_simplify_opts pamo_simplify_opts_default(void) {
  * of silently truncating the neighbour list. */
 #define PAMO_MAX_VALENCE 256
 
+static size_t progress_cadence_for_total(size_t total) {
+    if (total <= 4096) return total ? total : 1;
+    size_t cadence = total / 20; /* setup phases: coarse liveness updates */
+    if (cadence < 4096) cadence = 4096;
+    if (cadence > 16384) cadence = 16384;
+    return cadence;
+}
+
+static size_t collapse_progress_cadence_for_total(size_t total) {
+    if (total <= 32) return 4;
+    if (total <= 128) return 16;
+    if (total <= 512) return 32;
+    if (total <= 4096) return 128;
+    size_t cadence = total / 50; /* collapse phase: roughly one per 2 percent */
+    if (cadence < 128) cadence = 128;
+    if (cadence > 4096) cadence = 4096;
+    return cadence;
+}
+
+static void emit_loop_progress(const char *stage,
+                               size_t current,
+                               size_t total,
+                               size_t cadence) {
+    if (total == 0) {
+        pamo_emit_progress(stage, 0, 0);
+        return;
+    }
+    if (current >= total || cadence <= 1 || (current % cadence) == 0) {
+        pamo_emit_progress(stage, (int64_t)current, (int64_t)total);
+    }
+}
+
 /* ── Per-vertex quadric computation ──────────────────────────────── */
 
 static void compute_quadrics(const pamo_mesh *m, pamo_quadric *Q) {
@@ -555,9 +587,10 @@ static bool faces_share_vertex(const pamo_mesh *m, int32_t a, int32_t b) {
     return false;
 }
 
-static pamo_error mark_self_intersections(const pamo_mesh *m,
-                                          bool *hit_faces,
-                                          size_t *count_out) {
+static pamo_error mark_self_intersections_masked(const pamo_mesh *m,
+                                                 const bool *candidate_faces,
+                                                 bool *hit_faces,
+                                                 size_t *count_out) {
     if (!m || !count_out) return PAMO_ERR_INVALID_ARG;
     *count_out = 0;
     if (hit_faces) memset(hit_faces, 0, m->n_faces * sizeof(bool));
@@ -581,13 +614,20 @@ static pamo_error mark_self_intersections(const pamo_mesh *m,
     pamo_overlap_result ov;
     pamo_overlap_result_init(&ov, &alloc);
     for (size_t fi = 0; fi < m->n_faces; fi++) {
+        if (candidate_faces && !candidate_faces[fi]) continue;
         if (!pamo_mesh_face_is_valid(m, fi)) continue;
         pamo_aabb box = face_bounds_expanded(m, (int32_t)fi, eps);
         err = pamo_bvh_overlap(&bvh, box, &ov);
         if (err != PAMO_OK) break;
         for (size_t hit_i = 0; hit_i < ov.n_hits; hit_i++) {
             int32_t fj = ov.hits[hit_i];
-            if (fj <= (int32_t)fi) continue;
+            if (fj == (int32_t)fi) continue;
+            if (!candidate_faces && fj <= (int32_t)fi) continue;
+            if (candidate_faces &&
+                fj >= 0 && (size_t)fj < m->n_faces &&
+                candidate_faces[(size_t)fj] && fj <= (int32_t)fi) {
+                continue;
+            }
             if (!pamo_mesh_face_is_valid(m, (size_t)fj)) continue;
             if (faces_share_vertex(m, (int32_t)fi, fj)) continue;
             pamo_vec3d a0 = m->verts[m->faces[fi].v[0]];
@@ -609,6 +649,12 @@ static pamo_error mark_self_intersections(const pamo_mesh *m,
     pamo_overlap_result_destroy(&ov);
     pamo_bvh_destroy(&bvh);
     return err;
+}
+
+static pamo_error mark_self_intersections(const pamo_mesh *m,
+                                          bool *hit_faces,
+                                          size_t *count_out) {
+    return mark_self_intersections_masked(m, NULL, hit_faces, count_out);
 }
 
 /* ── Collapse record for undo ────────────────────────────────────── */
@@ -676,6 +722,23 @@ static void apply_collapse(pamo_mesh *m, int32_t u, int32_t v,
     }
 }
 
+static void mark_vertex_incident_faces(const pamo_mesh *m,
+                                       int32_t v,
+                                       bool *face_mask) {
+    if (!m || !face_mask || v < 0 || (size_t)v >= m->n_verts ||
+        !m->vert_face_offset || !m->vert_face_list) {
+        return;
+    }
+    int32_t s = m->vert_face_offset[v];
+    int32_t e = m->vert_face_offset[v + 1];
+    for (int32_t i = s; i < e; i++) {
+        int32_t fi = m->vert_face_list[i];
+        if (fi >= 0 && (size_t)fi < m->n_faces) {
+            face_mask[fi] = true;
+        }
+    }
+}
+
 static bool record_touches_hit_face(const pamo_mesh *m,
                                     const pamo_collapse_record *record,
                                     const bool *hit_faces) {
@@ -722,10 +785,13 @@ static pamo_error simplify_round(pamo_mesh *m,
                                  const bool *vert_locked,
                                  double cost_limit,
                                  bool relax_normals,
+                                 size_t *known_self_intersections,
                                  size_t *n_collapsed_out) {
     pamo_allocator *alloc = &m->alloc;
     *n_collapsed_out = 0;
 
+    pamo_emit_progress("simplify_round", 0,
+                       (int64_t)pamo_mesh_count_alive_faces(m));
     pamo_error err = pamo_mesh_build_adjacency(m);
     if (err != PAMO_OK) return err;
     if (m->n_edges == 0) {
@@ -736,14 +802,20 @@ static pamo_error simplify_round(pamo_mesh *m,
     /* Compute quadrics. */
     pamo_quadric *Q = PAMO_ALLOC_ARRAY(alloc, pamo_quadric, m->n_verts);
     if (!Q) { pamo_mesh_free_adjacency(m); return PAMO_ERR_ALLOC; }
+    pamo_emit_progress("simplify_quadric", 0, (int64_t)m->n_faces);
     compute_quadrics(m, Q);
+    pamo_emit_progress("simplify_quadric", (int64_t)m->n_faces,
+                       (int64_t)m->n_faces);
 
     /* Compute scale. */
     double scale_sum = 0.0;
+    const size_t scale_cadence = progress_cadence_for_total(m->n_edges);
+    pamo_emit_progress("simplify_scale", 0, (int64_t)m->n_edges);
     for (size_t i = 0; i < m->n_edges; i++) {
         pamo_vec3d d = pamo_v3_sub(m->verts[m->edges[i].u],
                                    m->verts[m->edges[i].v]);
         scale_sum += sqrt(pamo_v3_length_sq(d));
+        emit_loop_progress("simplify_scale", i + 1, m->n_edges, scale_cadence);
     }
     double scale = (m->n_edges > 0) ? scale_sum / (double)m->n_edges : 1.0;
 
@@ -762,6 +834,7 @@ static pamo_error simplify_round(pamo_mesh *m,
     pamo_tri *orig_faces = NULL;
     bool *orig_face_alive = NULL;
     bool *locked = NULL;
+    bool *changed_faces = NULL;
     pamo_collapse_record *records = NULL;
     size_t records_cap = 1;
     size_t self_intersections_before = 0;
@@ -778,15 +851,18 @@ static pamo_error simplify_round(pamo_mesh *m,
     }
 
     if (opts->check_self_intersection) {
+        changed_faces = PAMO_ALLOC_ARRAY(alloc, bool, m->n_faces);
         orig_verts = PAMO_ALLOC_ARRAY(alloc, pamo_vec3d, m->n_verts);
         orig_vert_alive = PAMO_ALLOC_ARRAY(alloc, bool, m->n_verts);
         orig_faces = PAMO_ALLOC_ARRAY(alloc, pamo_tri, m->n_faces);
         orig_face_alive = PAMO_ALLOC_ARRAY(alloc, bool, m->n_faces);
-        if ((m->n_verts > 0 && (!orig_verts || !orig_vert_alive)) ||
+        if ((m->n_faces > 0 && !changed_faces) ||
+            (m->n_verts > 0 && (!orig_verts || !orig_vert_alive)) ||
             (m->n_faces > 0 && (!orig_faces || !orig_face_alive))) {
             err = PAMO_ERR_ALLOC;
             goto cleanup;
         }
+        if (changed_faces) memset(changed_faces, 0, m->n_faces * sizeof(bool));
         if (m->n_verts > 0) {
             memcpy(orig_verts, m->verts, m->n_verts * sizeof(pamo_vec3d));
             memcpy(orig_vert_alive, m->vert_alive, m->n_verts * sizeof(bool));
@@ -795,8 +871,19 @@ static pamo_error simplify_round(pamo_mesh *m,
             memcpy(orig_faces, m->faces, m->n_faces * sizeof(pamo_tri));
             memcpy(orig_face_alive, m->face_alive, m->n_faces * sizeof(bool));
         }
-        err = mark_self_intersections(m, NULL, &self_intersections_before);
-        if (err != PAMO_OK) goto cleanup;
+        if (known_self_intersections &&
+            *known_self_intersections != (size_t)-1) {
+            self_intersections_before = *known_self_intersections;
+        } else {
+            pamo_emit_progress("simplify_self_baseline", 0, (int64_t)m->n_faces);
+            err = mark_self_intersections(m, NULL, &self_intersections_before);
+            if (err != PAMO_OK) goto cleanup;
+            pamo_emit_progress("simplify_self_baseline", (int64_t)m->n_faces,
+                               (int64_t)m->n_faces);
+            if (known_self_intersections) {
+                *known_self_intersections = self_intersections_before;
+            }
+        }
     }
 
     /* Normal flip threshold: 0 = strict (no flip allowed),
@@ -804,6 +891,8 @@ static pamo_error simplify_round(pamo_mesh *m,
     double flip_thresh = relax_normals ? -0.5 : 0.0;
 
     size_t n_valid = 0;
+    const size_t score_cadence = progress_cadence_for_total(m->n_edges);
+    pamo_emit_progress("simplify_score", 0, (int64_t)m->n_edges);
     for (size_t i = 0; i < m->n_edges; i++) {
         double c = compute_edge_cost(m, Q, i, scale,
                                      opts->skinny_penalty_weight,
@@ -819,9 +908,13 @@ static pamo_error simplify_round(pamo_mesh *m,
             costs[n_valid].edge_idx = (int32_t)i;
             n_valid++;
         }
+        emit_loop_progress("simplify_score", i + 1, m->n_edges,
+                           score_cadence);
     }
 
+    pamo_emit_progress("simplify_sort", 0, (int64_t)n_valid);
     pamo_sort_edge_costs(costs, n_valid);
+    pamo_emit_progress("simplify_sort", (int64_t)n_valid, (int64_t)n_valid);
 
     /* Greedy selection. */
     records_cap = n_valid > 0 ? n_valid : 1;
@@ -840,13 +933,22 @@ static pamo_error simplify_round(pamo_mesh *m,
     }
 
     size_t n_accepted = 0;
+    const size_t select_cadence = progress_cadence_for_total(n_valid);
+    pamo_emit_progress("simplify_select", 0, (int64_t)n_valid);
     for (size_t i = 0; i < n_valid; i++) {
         int32_t ei = costs[i].edge_idx;
         int32_t u = m->edges[ei].u;
         int32_t v = m->edges[ei].v;
-        if (locked[u] || locked[v]) continue;
-        if (!edge_is_local_triangle_min(m, (size_t)ei, tri_min_edge))
+        if (locked[u] || locked[v]) {
+            emit_loop_progress("simplify_select", i + 1, n_valid,
+                               select_cadence);
             continue;
+        }
+        if (!edge_is_local_triangle_min(m, (size_t)ei, tri_min_edge)) {
+            emit_loop_progress("simplify_select", i + 1, n_valid,
+                               select_cadence);
+            continue;
+        }
 
         /* CUDA PaMO uses the per-triangle local-min rule to prevent
          * conflicting collapse batches. Keep only endpoint locks here so
@@ -859,24 +961,26 @@ static pamo_error simplify_round(pamo_mesh *m,
         records[n_accepted].applied = false;
         records[n_accepted].undone = false;
         n_accepted++;
+        emit_loop_progress("simplify_select", i + 1, n_valid,
+                           select_cadence);
     }
 
     /* Apply collapses with runtime validation.
      * Re-check the link condition before each collapse since
      * earlier collapses in this round may have changed topology. */
     size_t actually_collapsed = 0;
-    /* Sub-iter progress emit cadence — every PROGRESS_CADENCE iterations
-     * of this loop. 256 keeps emit overhead negligible while making the
-     * Blender bar tick visibly during multi-second outer rounds.        */
-    const size_t PROGRESS_CADENCE = 256;
+    /* Small accepted batches report every candidate, while large rounds
+     * report roughly once per percent. */
+    const size_t PROGRESS_CADENCE =
+        collapse_progress_cadence_for_total(n_accepted);
     pamo_emit_progress("simplify_collapse", 0, (int64_t)n_accepted);
     for (size_t i = 0; i < n_accepted; i++) {
-        if ((i % PROGRESS_CADENCE) == 0 && i > 0) {
-            pamo_emit_progress("simplify_collapse", (int64_t)i,
-                               (int64_t)n_accepted);
-        }
         int32_t u = records[i].u, v = records[i].v;
-        if (!m->vert_alive[u] || !m->vert_alive[v]) continue;
+        if (!m->vert_alive[u] || !m->vert_alive[v]) {
+            emit_loop_progress("simplify_collapse", i + 1, n_accepted,
+                               PROGRESS_CADENCE);
+            continue;
+        }
 
         /* Re-verify link condition with current face state. */
         /* Count shared faces (faces containing both u and v). */
@@ -889,7 +993,11 @@ static pamo_error simplify_round(pamo_mesh *m,
             const int32_t *fv = m->faces[fi].v;
             if (fv[0] == v || fv[1] == v || fv[2] == v) shared++;
         }
-        if (shared == 0) continue;  /* disconnected: skip */
+        if (shared == 0) {  /* disconnected: skip */
+            emit_loop_progress("simplify_collapse", i + 1, n_accepted,
+                               PROGRESS_CADENCE);
+            continue;
+        }
 
         /* Count shared vertex neighbors. */
         int32_t u_nb[PAMO_MAX_VALENCE], n_un = 0;
@@ -911,7 +1019,11 @@ static pamo_error simplify_round(pamo_mesh *m,
         }
         /* Valence exceeded stack buffer — skip this collapse rather
          * than silently truncating the neighbour set. */
-        if (nb_overflow) continue;
+        if (nb_overflow) {
+            emit_loop_progress("simplify_collapse", i + 1, n_accepted,
+                               PROGRESS_CADENCE);
+            continue;
+        }
         int32_t v_s2 = m->vert_face_offset[v];
         int32_t v_e2 = m->vert_face_offset[v + 1];
         int32_t n_shared_nb = 0;
@@ -933,7 +1045,11 @@ static pamo_error simplify_round(pamo_mesh *m,
         else if (shared == 1) safe = (n_shared_nb == 1);
         else safe = false;
 
-        if (!safe) continue;
+        if (!safe) {
+            emit_loop_progress("simplify_collapse", i + 1, n_accepted,
+                               PROGRESS_CADENCE);
+            continue;
+        }
 
         pamo_vec3d point = compute_collapse_point(m, Q, u, v);
         if (collapse_creates_problem(m, u, v, point,
@@ -943,11 +1059,19 @@ static pamo_error simplify_round(pamo_mesh *m,
             (opts->fold_guard_min_dot > -1.0 &&
              collapse_creates_fold(m, u, v, point,
                                    opts->fold_guard_min_dot))) {
+            emit_loop_progress("simplify_collapse", i + 1, n_accepted,
+                               PROGRESS_CADENCE);
             continue;
+        }
+        if (changed_faces) {
+            mark_vertex_incident_faces(m, u, changed_faces);
+            mark_vertex_incident_faces(m, v, changed_faces);
         }
         apply_collapse(m, u, v, point);
         records[i].applied = true;
         actually_collapsed++;
+        emit_loop_progress("simplify_collapse", i + 1, n_accepted,
+                           PROGRESS_CADENCE);
     }
 
     if (opts->check_self_intersection && actually_collapsed > 0) {
@@ -958,25 +1082,54 @@ static pamo_error simplify_round(pamo_mesh *m,
         }
 
         size_t self_intersections_after = 0;
-        err = mark_self_intersections(m, hit_faces, &self_intersections_after);
+        bool local_clean_check = false;
+        pamo_emit_progress("simplify_self_check", 0,
+                           (int64_t)actually_collapsed);
+        if (self_intersections_before == 0 && changed_faces) {
+            err = mark_self_intersections_masked(m, changed_faces, hit_faces,
+                                                 &self_intersections_after);
+            if (err != PAMO_OK) {
+                if (hit_faces) PAMO_FREE_ARRAY(alloc, hit_faces, bool, m->n_faces);
+                goto cleanup;
+            }
+            local_clean_check = (self_intersections_after == 0);
+        }
+        if (!local_clean_check) {
+            err = mark_self_intersections(m, hit_faces,
+                                          &self_intersections_after);
+        }
         if (err != PAMO_OK) {
             if (hit_faces) PAMO_FREE_ARRAY(alloc, hit_faces, bool, m->n_faces);
             goto cleanup;
         }
+        pamo_emit_progress("simplify_self_check", (int64_t)actually_collapsed,
+                           (int64_t)actually_collapsed);
 
         int32_t undo_retry = 0;
         while (self_intersections_after > self_intersections_before &&
                undo_retry < opts->max_undo_retries) {
             size_t undone_this_pass = 0;
+            const size_t undo_cadence =
+                collapse_progress_cadence_for_total(n_accepted);
+            pamo_emit_progress("simplify_undo", 0, (int64_t)n_accepted);
             for (size_t i = 0; i < n_accepted; i++) {
-                if (!records[i].applied || records[i].undone) continue;
-                if (!record_touches_hit_face(m, &records[i], hit_faces))
+                if (!records[i].applied || records[i].undone) {
+                    emit_loop_progress("simplify_undo", i + 1, n_accepted,
+                                       undo_cadence);
                     continue;
+                }
+                if (!record_touches_hit_face(m, &records[i], hit_faces)) {
+                    emit_loop_progress("simplify_undo", i + 1, n_accepted,
+                                       undo_cadence);
+                    continue;
+                }
                 restore_record_from_snapshot(m, &records[i],
                                              orig_verts, orig_vert_alive,
                                              orig_faces, orig_face_alive);
                 records[i].undone = true;
                 undone_this_pass++;
+                emit_loop_progress("simplify_undo", i + 1, n_accepted,
+                                   undo_cadence);
             }
 
             if (undone_this_pass == 0) break;
@@ -1001,6 +1154,11 @@ static pamo_error simplify_round(pamo_mesh *m,
                 records[i].undone = true;
             }
             actually_collapsed = 0;
+            self_intersections_after = self_intersections_before;
+        }
+
+        if (known_self_intersections) {
+            *known_self_intersections = self_intersections_after;
         }
 
         if (hit_faces) PAMO_FREE_ARRAY(alloc, hit_faces, bool, m->n_faces);
@@ -1019,6 +1177,7 @@ cleanup:
     if (tri_min_cost) PAMO_FREE_ARRAY(alloc, tri_min_cost, double, m->n_faces);
     if (records)
         PAMO_FREE_ARRAY(alloc, records, pamo_collapse_record, records_cap);
+    if (changed_faces) PAMO_FREE_ARRAY(alloc, changed_faces, bool, m->n_faces);
     if (locked) PAMO_FREE_ARRAY(alloc, locked, bool, m->n_verts);
     PAMO_FREE_ARRAY(alloc, costs, pamo_edge_cost_entry, m->n_edges);
     PAMO_FREE_ARRAY(alloc, Q, pamo_quadric, m->n_verts);
@@ -1036,6 +1195,7 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
     int32_t stuck_counter = 0;
     double cost_limit = opts->cost_range;
+    size_t known_self_intersections = (size_t)-1;
     pamo_emit_progress("simplify_start", 0,
                        (int64_t)pamo_mesh_count_alive_faces(mesh));
 
@@ -1052,7 +1212,8 @@ pamo_error pamo_simplify(pamo_mesh *mesh, const pamo_simplify_opts *opts) {
 
         size_t n_collapsed = 0;
         bool relax = (stuck_counter >= 2); /* relax normals when deeply stuck */
-        err = simplify_round(mesh, opts, NULL, cost_limit, relax, &n_collapsed);
+        err = simplify_round(mesh, opts, NULL, cost_limit, relax,
+                             &known_self_intersections, &n_collapsed);
         if (err != PAMO_OK) return err;
 
         err = pamo_mesh_compact(mesh);

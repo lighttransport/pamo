@@ -233,25 +233,24 @@ void pamo_elastic_hess_diag(const pamo_mesh *m, const pamo_vec3d *q,
     (void)q;
 }
 
-/* Hessian-vector product via finite differences. */
-void pamo_elastic_hess_vec_fd(const pamo_mesh *m, pamo_vec3d *q,
-                              const pamo_elastic_rest *rest,
-                              double young, double poisson,
-                              const double *dx, double *out) {
-    double eps = 1e-6;
-    size_t dim = m->n_verts * 3;
+/* Hessian-vector product via finite differences, reusing a baseline
+ * elastic gradient computed at the current Newton iterate. SAFE projection
+ * calls this from CG many times per Newton step; recomputing grad(q) for
+ * every Hessian-vector product doubles the elastic-gradient work.
+ */
+void pamo_elastic_hess_vec_fd_with_baseline(const pamo_mesh *m, pamo_vec3d *q,
+                                            const pamo_elastic_rest *rest,
+                                            double young, double poisson,
+                                            const double *grad0,
+                                            double *grad1,
+                                            const double *dx, double *out) {
+    if (!m || !q || !rest || !grad0 || !grad1 || !dx || !out) return;
+    if (m->n_verts > SIZE_MAX / 3u) return;
+    size_t dim = m->n_verts * 3u;
     if (dim > SIZE_MAX / sizeof(double)) return;
 
-    pamo_allocator alloc = pamo_default_allocator();
-    double *grad0 = (double *)pamo_alloc(&alloc, dim * sizeof(double));
-    double *grad1 = (double *)pamo_alloc(&alloc, dim * sizeof(double));
-    if (!grad0 || !grad1) {
-        if (grad0) pamo_free(&alloc, grad0, dim * sizeof(double));
-        if (grad1) pamo_free(&alloc, grad1, dim * sizeof(double));
-        return;
-    }
-
-    pamo_elastic_gradient_fd(m, q, rest, young, poisson, grad0);
+    const double eps = 1e-6;
+    memset(grad1, 0, dim * sizeof(double));
 
     /* Perturb: q + eps * dx. */
     for (size_t i = 0; i < m->n_verts; i++) {
@@ -270,6 +269,32 @@ void pamo_elastic_hess_vec_fd(const pamo_mesh *m, pamo_vec3d *q,
     for (size_t i = 0; i < dim; i++) {
         out[i] += (grad1[i] - grad0[i]) / eps;
     }
+}
+
+/* Hessian-vector product via finite differences. */
+void pamo_elastic_hess_vec_fd(const pamo_mesh *m, pamo_vec3d *q,
+                              const pamo_elastic_rest *rest,
+                              double young, double poisson,
+                              const double *dx, double *out) {
+    if (!m || !q || !rest || !dx || !out) return;
+    if (m->n_verts > SIZE_MAX / 3u) return;
+    size_t dim = m->n_verts * 3u;
+    if (dim > SIZE_MAX / sizeof(double)) return;
+
+    pamo_allocator alloc = pamo_default_allocator();
+    double *grad0 = (double *)pamo_alloc(&alloc, dim * sizeof(double));
+    double *grad1 = (double *)pamo_alloc(&alloc, dim * sizeof(double));
+    if (!grad0 || !grad1) {
+        if (grad0) pamo_free(&alloc, grad0, dim * sizeof(double));
+        if (grad1) pamo_free(&alloc, grad1, dim * sizeof(double));
+        return;
+    }
+
+    memset(grad0, 0, dim * sizeof(double));
+    pamo_elastic_gradient_fd(m, q, rest, young, poisson, grad0);
+    pamo_elastic_hess_vec_fd_with_baseline(m, q, rest, young, poisson,
+                                           grad0, grad1, dx, out);
+
     pamo_free(&alloc, grad0, dim * sizeof(double));
     pamo_free(&alloc, grad1, dim * sizeof(double));
 }

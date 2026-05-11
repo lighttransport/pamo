@@ -104,6 +104,21 @@ static lightrt_bvh *build_lightrt_from_mesh(const pamo_mesh *m) {
 
 /* ── Parallel Phase 1 worker ─────────────────────────────────────── */
 
+#ifdef PAMO_USE_PTHREADS
+static int pamo_sdf_thread_count(int32_t max_tasks) {
+    int nt = 0;
+    const char *ev = getenv("PAMO_NUM_THREADS");
+    if (ev && ev[0]) nt = atoi(ev);
+    if (nt <= 0) {
+        long on = sysconf(_SC_NPROCESSORS_ONLN);
+        nt = (on > 0) ? (int)on : 8;
+    }
+    if (max_tasks > 0 && nt > max_tasks) nt = max_tasks;
+    if (nt < 1) nt = 1;
+    return nt;
+}
+#endif
+
 #if defined(PAMO_USE_PTHREADS) && defined(PAMO_USE_LIGHTRT)
 typedef struct {
     const void *bvh;
@@ -135,6 +150,151 @@ static void *sdf_worker(void *arg) {
 }
 #endif
 
+#ifdef PAMO_USE_PTHREADS
+typedef struct {
+    const pamo_mesh *mesh;
+    const pamo_bvh *bvh;
+    float *grid;
+    const uint8_t *active;
+    int32_t R, iz_start, iz_end;
+    double grid_ox, grid_oy, grid_oz;
+    double voxel_size;
+    float band;
+} sdf_fallback_nearest_arg;
+
+static void *sdf_fallback_nearest_worker(void *arg) {
+    sdf_fallback_nearest_arg *a = (sdf_fallback_nearest_arg *)arg;
+    const double band = (double)a->band;
+    for (int32_t iz = a->iz_start; iz < a->iz_end; iz++)
+        for (int32_t iy = 0; iy < a->R; iy++)
+            for (int32_t ix = 0; ix < a->R; ix++) {
+                size_t idx = GRID_IDX(ix, iy, iz, a->R);
+                if (a->active && !a->active[idx]) continue;
+                pamo_vec3d p = {
+                    a->grid_ox + ((double)ix + 0.5) * a->voxel_size,
+                    a->grid_oy + ((double)iy + 0.5) * a->voxel_size,
+                    a->grid_oz + ((double)iz + 0.5) * a->voxel_size,
+                };
+                pamo_nearest_result res;
+                if (pamo_bvh_nearest(a->bvh, a->mesh, p, &res) != PAMO_OK ||
+                    res.prim_id < 0) {
+                    continue;
+                }
+                double d = sqrt(res.dist_sq);
+                if (d < band) a->grid[idx] = (float)d;
+            }
+    return NULL;
+}
+#endif
+
+typedef struct {
+    int32_t ixlo, ixhi;
+    int32_t iylo, iyhi;
+    int32_t izlo, izhi;
+} sdf_grid_bounds;
+
+static int sdf_face_grid_bounds(const pamo_mesh *m, size_t fi,
+                                pamo_vec3d grid_origin, double voxel_size,
+                                int32_t R, double band,
+                                int32_t iz_start, int32_t iz_end,
+                                sdf_grid_bounds *out) {
+    if (!m || !out || fi >= m->n_faces || !m->face_alive[fi])
+        return 0;
+    if (!pamo_mesh_face_is_valid(m, fi))
+        return 0;
+    const int32_t *fv = m->faces[fi].v;
+    double v0x=m->verts[fv[0]].x, v0y=m->verts[fv[0]].y, v0z=m->verts[fv[0]].z;
+    double v1x=m->verts[fv[1]].x, v1y=m->verts[fv[1]].y, v1z=m->verts[fv[1]].z;
+    double v2x=m->verts[fv[2]].x, v2y=m->verts[fv[2]].y, v2z=m->verts[fv[2]].z;
+    double xlo = fmin(fmin(v0x,v1x),v2x) - band;
+    double xhi = fmax(fmax(v0x,v1x),v2x) + band;
+    double ylo = fmin(fmin(v0y,v1y),v2y) - band;
+    double yhi = fmax(fmax(v0y,v1y),v2y) + band;
+    double zlo = fmin(fmin(v0z,v1z),v2z) - band;
+    double zhi = fmax(fmax(v0z,v1z),v2z) + band;
+    int32_t ixlo = (int32_t)floor((xlo - grid_origin.x) / voxel_size);
+    int32_t ixhi = (int32_t)ceil ((xhi - grid_origin.x) / voxel_size);
+    int32_t iylo = (int32_t)floor((ylo - grid_origin.y) / voxel_size);
+    int32_t iyhi = (int32_t)ceil ((yhi - grid_origin.y) / voxel_size);
+    int32_t izlo = (int32_t)floor((zlo - grid_origin.z) / voxel_size);
+    int32_t izhi = (int32_t)ceil ((zhi - grid_origin.z) / voxel_size);
+    if (ixlo < 0) ixlo = 0;
+    if (ixhi > R - 1) ixhi = R - 1;
+    if (iylo < 0) iylo = 0;
+    if (iyhi > R - 1) iyhi = R - 1;
+    if (izlo < 0) izlo = 0;
+    if (izhi > R - 1) izhi = R - 1;
+    if (izlo < iz_start) izlo = iz_start;
+    if (izhi >= iz_end) izhi = iz_end - 1;
+    if (ixlo > ixhi || iylo > iyhi || izlo > izhi)
+        return 0;
+    out->ixlo = ixlo; out->ixhi = ixhi;
+    out->iylo = iylo; out->iyhi = iyhi;
+    out->izlo = izlo; out->izhi = izhi;
+    return 1;
+}
+
+typedef struct {
+    const pamo_mesh *mesh;
+    float *grid;
+    int32_t R, iz_start, iz_end;
+    pamo_vec3d grid_origin;
+    double voxel_size;
+    double band;
+} sdf_raster_distance_arg;
+
+static void sdf_rasterize_distance_range(const pamo_mesh *m, float *grid,
+                                         int32_t R,
+                                         pamo_vec3d grid_origin,
+                                         double voxel_size, double band,
+                                         int32_t iz_start, int32_t iz_end) {
+    const double band_sq = band * band;
+    for (size_t fi = 0; fi < m->n_faces; fi++) {
+        sdf_grid_bounds gb;
+        if (!sdf_face_grid_bounds(m, fi, grid_origin, voxel_size, R, band,
+                                  iz_start, iz_end, &gb)) {
+            continue;
+        }
+        const int32_t *fv = m->faces[fi].v;
+        pamo_vec3d v0 = m->verts[fv[0]];
+        pamo_vec3d v1 = m->verts[fv[1]];
+        pamo_vec3d v2 = m->verts[fv[2]];
+        for (int32_t iz = gb.izlo; iz <= gb.izhi; iz++) {
+            double pz = grid_origin.z + ((double)iz + 0.5) * voxel_size;
+            for (int32_t iy = gb.iylo; iy <= gb.iyhi; iy++) {
+                double py = grid_origin.y + ((double)iy + 0.5) * voxel_size;
+                for (int32_t ix = gb.ixlo; ix <= gb.ixhi; ix++) {
+                    size_t idx = GRID_IDX(ix, iy, iz, R);
+                    float old = grid[idx];
+                    double old_sq = (double)old * (double)old;
+                    if (old_sq <= 0.0 || old_sq <= band_sq * 1.0e-12)
+                        continue;
+                    pamo_vec3d p = {
+                        grid_origin.x + ((double)ix + 0.5) * voxel_size,
+                        py,
+                        pz,
+                    };
+                    double dsq;
+                    pamo_closest_point_on_tri(p, v0, v1, v2, &dsq);
+                    if (dsq < band_sq && dsq < old_sq) {
+                        grid[idx] = (float)sqrt(dsq);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#ifdef PAMO_USE_PTHREADS
+static void *sdf_raster_distance_worker(void *arg) {
+    sdf_raster_distance_arg *a = (sdf_raster_distance_arg *)arg;
+    sdf_rasterize_distance_range(a->mesh, a->grid, a->R, a->grid_origin,
+                                 a->voxel_size, a->band,
+                                 a->iz_start, a->iz_end);
+    return NULL;
+}
+#endif
+
 /* ── Ray-triangle hit (for fallback) ─────────────────────────────── */
 
 static float ray_tri_hitf(float ox, float oy, float oz,
@@ -158,6 +318,117 @@ static float ray_tri_hitf(float ox, float oy, float oz,
     return t > 1e-6f ? t : -1.0f;
 }
 
+/* ── Parallel Phase 2 ray workers ────────────────────────────────── */
+
+#if defined(PAMO_USE_PTHREADS) && defined(PAMO_USE_LIGHTRT)
+typedef struct {
+    const void *bvh;
+    uint8_t *collide;
+    const float *dist;
+    int32_t R, iz_start, iz_end;
+    float grid_ox, grid_oy, grid_oz;
+    float voxel_size, rayth;
+} sdf_lightrt_rays_arg;
+
+static void *sdf_lightrt_rays_worker(void *arg) {
+    sdf_lightrt_rays_arg *a = (sdf_lightrt_rays_arg *)arg;
+    const lightrt_bvh *bvh = (const lightrt_bvh *)a->bvh;
+    for (int32_t iz = a->iz_start; iz < a->iz_end; iz++)
+        for (int32_t iy = 0; iy < a->R; iy++)
+            for (int32_t ix = 0; ix < a->R; ix++) {
+                size_t idx = GRID_IDX(ix, iy, iz, a->R);
+                if (a->dist[idx] > a->rayth) continue;
+                float px = a->grid_ox + ((float)ix + 0.5f) * a->voxel_size;
+                float py = a->grid_oy + ((float)iy + 0.5f) * a->voxel_size;
+                float pz = a->grid_oz + ((float)iz + 0.5f) * a->voxel_size;
+                float o[3] = {px, py, pz};
+                float d[3] = {1.0f, 0.0f, 0.0f};
+                if (lightrt_bvh_any_hit(bvh, o, d, a->rayth)) a->collide[idx*3] = 1;
+                d[0]=0.0f; d[1]=1.0f; d[2]=0.0f;
+                if (lightrt_bvh_any_hit(bvh, o, d, a->rayth)) a->collide[idx*3+1] = 1;
+                d[0]=0.0f; d[1]=0.0f; d[2]=1.0f;
+                if (lightrt_bvh_any_hit(bvh, o, d, a->rayth)) a->collide[idx*3+2] = 1;
+            }
+    return NULL;
+}
+#endif
+
+#ifdef PAMO_USE_PTHREADS
+typedef struct {
+    const pamo_mesh *mesh;
+    const pamo_bvh *bvh;
+    uint8_t *collide;
+    const float *dist;
+    int32_t R, iz_start, iz_end;
+    float grid_ox, grid_oy, grid_oz;
+    float voxel_size, rayth;
+} sdf_fallback_rays_arg;
+
+static void pamo_sdf_test_candidate_tri(const pamo_mesh *m, int32_t fi,
+                                        float px, float py, float pz,
+                                        float rayth, uint8_t *flags) {
+    if (fi < 0 || (size_t)fi >= m->n_faces) return;
+    if (!m->face_alive[fi]) return;
+    const int32_t *fv = m->faces[fi].v;
+    float v0x=(float)m->verts[fv[0]].x;
+    float v0y=(float)m->verts[fv[0]].y;
+    float v0z=(float)m->verts[fv[0]].z;
+    float v1x=(float)m->verts[fv[1]].x;
+    float v1y=(float)m->verts[fv[1]].y;
+    float v1z=(float)m->verts[fv[1]].z;
+    float v2x=(float)m->verts[fv[2]].x;
+    float v2y=(float)m->verts[fv[2]].y;
+    float v2z=(float)m->verts[fv[2]].z;
+    float t;
+    if (!flags[0]) {
+        t = ray_tri_hitf(px,py,pz, 1,0,0, v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z);
+        if (t >= 0.0f && t <= rayth) flags[0] = 1;
+    }
+    if (!flags[1]) {
+        t = ray_tri_hitf(px,py,pz, 0,1,0, v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z);
+        if (t >= 0.0f && t <= rayth) flags[1] = 1;
+    }
+    if (!flags[2]) {
+        t = ray_tri_hitf(px,py,pz, 0,0,1, v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z);
+        if (t >= 0.0f && t <= rayth) flags[2] = 1;
+    }
+}
+
+static void *sdf_fallback_rays_worker(void *arg) {
+    sdf_fallback_rays_arg *a = (sdf_fallback_rays_arg *)arg;
+    pamo_overlap_result ov;
+    pamo_overlap_result_init(&ov, &a->mesh->alloc);
+    for (int32_t iz = a->iz_start; iz < a->iz_end; iz++)
+        for (int32_t iy = 0; iy < a->R; iy++)
+            for (int32_t ix = 0; ix < a->R; ix++) {
+                size_t idx = GRID_IDX(ix, iy, iz, a->R);
+                if (a->dist[idx] > a->rayth) continue;
+                float px = a->grid_ox + ((float)ix + 0.5f) * a->voxel_size;
+                float py = a->grid_oy + ((float)iy + 0.5f) * a->voxel_size;
+                float pz = a->grid_oz + ((float)iz + 0.5f) * a->voxel_size;
+
+                pamo_aabb box;
+                double eps = (double)a->rayth + 1e-6;
+                box.lo.x = (double)px - eps;
+                box.lo.y = (double)py - eps;
+                box.lo.z = (double)pz - eps;
+                box.hi.x = (double)px + eps;
+                box.hi.y = (double)py + eps;
+                box.hi.z = (double)pz + eps;
+                if (pamo_bvh_overlap(a->bvh, box, &ov) != PAMO_OK) continue;
+
+                uint8_t *flags = &a->collide[idx*3];
+                for (size_t hi = 0; hi < ov.n_hits; hi++) {
+                    pamo_sdf_test_candidate_tri(a->mesh, ov.hits[hi],
+                                                px, py, pz, a->rayth, flags);
+                    if (flags[0] && flags[1] && flags[2]) break;
+                }
+            }
+    pamo_overlap_result_destroy(&ov);
+    return NULL;
+}
+#endif
+
 /* ── Main SDF computation ────────────────────────────────────────── */
 
 /* Phase profiling: set PAMO_SDF_PROFILE=1 to print per-phase wall time. */
@@ -171,6 +442,11 @@ static double pamo_sdf_now_s(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+static int pamo_sdf_raster_phase1_on(void) {
+    const char *e = getenv("PAMO_SDF_RASTER_PHASE1");
+    return !(e && e[0] == '0');
 }
 
 pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
@@ -286,30 +562,48 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
     if (use_lightrt) {
 #ifdef PAMO_USE_LIGHTRT
 #ifdef PAMO_USE_PTHREADS
-        /* Thread count: env override PAMO_NUM_THREADS, else online CPUs
-         * (clamped to [1, R]; per-z-slab partition gives at most R tasks). */
-        int nt = 0;
-        const char *ev = getenv("PAMO_NUM_THREADS");
-        if (ev && ev[0]) nt = atoi(ev);
-        if (nt <= 0) {
-            long on = sysconf(_SC_NPROCESSORS_ONLN);
-            nt = (on > 0) ? (int)on : 8;
-        }
-        if (nt > R) nt = R;
-        if (nt < 1) nt = 1;
+        int nt = pamo_sdf_thread_count(R);
+        if (prof) fprintf(stderr, "[sdf-prof] %-22s %d\n", "pamo-threads", nt);
         pthread_t *thr = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
         sdf_worker_arg *args = (sdf_worker_arg *)malloc((size_t)nt * sizeof(sdf_worker_arg));
-        int32_t per = (R + nt - 1) / nt;
-        for (int t = 0; t < nt; t++) {
-            args[t] = (sdf_worker_arg){
-                .bvh = lbvh, .grid = dist, .active = active, .R = R,
-                .iz_start = t*per, .iz_end = (t+1)*per > R ? R : (t+1)*per,
-                .grid_ox = gox, .grid_oy = goy, .grid_oz = goz,
-                .voxel_size = vs, .band = band,
-            };
-            pthread_create(&thr[t], NULL, sdf_worker, &args[t]);
+        if (thr && args) {
+            int32_t per = (R + nt - 1) / nt;
+            int created = 0;
+            for (int t = 0; t < nt; t++) {
+                args[t] = (sdf_worker_arg){
+                    .bvh = lbvh, .grid = dist, .active = active, .R = R,
+                    .iz_start = t*per, .iz_end = (t+1)*per > R ? R : (t+1)*per,
+                    .grid_ox = gox, .grid_oy = goy, .grid_oz = goz,
+                    .voxel_size = vs, .band = band,
+                };
+                if (pthread_create(&thr[t], NULL, sdf_worker, &args[t]) == 0)
+                    created++;
+                else
+                    break;
+            }
+            for (int t = 0; t < created; t++) pthread_join(thr[t], NULL);
+            if (created != nt) {
+                float band_sq = band * band;
+                for (int32_t iz = 0; iz < R; iz++)
+                    for (int32_t iy = 0; iy < R; iy++)
+                        for (int32_t ix = 0; ix < R; ix++) {
+                            size_t idx = GRID_IDX(ix,iy,iz,R);
+                            if (!active[idx]) continue;
+                            float p[3] = {gox+((float)ix+0.5f)*vs, goy+((float)iy+0.5f)*vs, goz+((float)iz+0.5f)*vs};
+                            dist[idx] = sqrtf(lightrt_bvh_nearest_bounded(lbvh, p, band_sq));
+                        }
+            }
+        } else {
+            float band_sq = band * band;
+            for (int32_t iz = 0; iz < R; iz++)
+                for (int32_t iy = 0; iy < R; iy++)
+                    for (int32_t ix = 0; ix < R; ix++) {
+                        size_t idx = GRID_IDX(ix,iy,iz,R);
+                        if (!active[idx]) continue;
+                        float p[3] = {gox+((float)ix+0.5f)*vs, goy+((float)iy+0.5f)*vs, goz+((float)iz+0.5f)*vs};
+                        dist[idx] = sqrtf(lightrt_bvh_nearest_bounded(lbvh, p, band_sq));
+                    }
         }
-        for (int t = 0; t < nt; t++) pthread_join(thr[t], NULL);
         free(thr); free(args);
 #else
         float band_sq = band * band;
@@ -325,6 +619,78 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
 #endif /* PAMO_USE_LIGHTRT */
     } else {
         /* Fallback: pamo BVH. */
+        if (pamo_sdf_raster_phase1_on()) {
+            if (prof) fprintf(stderr, "[sdf-prof] %-22s %s\n",
+                              "phase1-mode", "triangle-raster");
+#ifdef PAMO_USE_PTHREADS
+            int nt = pamo_sdf_thread_count(R);
+            if (prof) fprintf(stderr, "[sdf-prof] %-22s %d\n", "pamo-threads", nt);
+            pthread_t *thr = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
+            sdf_raster_distance_arg *args =
+                (sdf_raster_distance_arg *)malloc((size_t)nt * sizeof(sdf_raster_distance_arg));
+            int threaded = 0;
+            if (thr && args) {
+                int32_t per = (R + nt - 1) / nt;
+                int created = 0;
+                for (int t = 0; t < nt; t++) {
+                    args[t] = (sdf_raster_distance_arg){
+                        .mesh = m, .grid = dist, .R = R,
+                        .iz_start = t*per,
+                        .iz_end = (t+1)*per > R ? R : (t+1)*per,
+                        .grid_origin = grid_origin,
+                        .voxel_size = voxel_size,
+                        .band = (double)band,
+                    };
+                    if (pthread_create(&thr[t], NULL, sdf_raster_distance_worker, &args[t]) == 0)
+                        created++;
+                    else
+                        break;
+                }
+                for (int t = 0; t < created; t++) pthread_join(thr[t], NULL);
+                threaded = (created == nt);
+            }
+            free(thr); free(args);
+            if (threaded) {
+                goto pamo_sdf_phase1_done;
+            }
+#endif
+            sdf_rasterize_distance_range(m, dist, R, grid_origin, voxel_size,
+                                         (double)band, 0, R);
+            goto pamo_sdf_phase1_done;
+        }
+
+#ifdef PAMO_USE_PTHREADS
+        {
+            int nt = pamo_sdf_thread_count(R);
+            if (prof) fprintf(stderr, "[sdf-prof] %-22s %d\n", "pamo-threads", nt);
+            pthread_t *thr = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
+            sdf_fallback_nearest_arg *args =
+                (sdf_fallback_nearest_arg *)malloc((size_t)nt * sizeof(sdf_fallback_nearest_arg));
+            if (thr && args) {
+                int32_t per = (R + nt - 1) / nt;
+                int created = 0;
+                for (int t = 0; t < nt; t++) {
+                    args[t] = (sdf_fallback_nearest_arg){
+                        .mesh = m, .bvh = bvh, .grid = dist, .active = active, .R = R,
+                        .iz_start = t*per, .iz_end = (t+1)*per > R ? R : (t+1)*per,
+                        .grid_ox = grid_origin.x, .grid_oy = grid_origin.y,
+                        .grid_oz = grid_origin.z, .voxel_size = voxel_size,
+                        .band = band,
+                    };
+                    if (pthread_create(&thr[t], NULL, sdf_fallback_nearest_worker, &args[t]) == 0)
+                        created++;
+                    else
+                        break;
+                }
+                for (int t = 0; t < created; t++) pthread_join(thr[t], NULL);
+                if (created == nt) {
+                    free(thr); free(args);
+                    goto pamo_sdf_phase1_done;
+                }
+            }
+            free(thr); free(args);
+        }
+#endif
         for (int32_t iz = 0; iz < R; iz++)
             for (int32_t iy = 0; iy < R; iy++)
                 for (int32_t ix = 0; ix < R; ix++) {
@@ -342,7 +708,8 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                     if (d < band) dist[idx] = d;
                 }
     }
-    PAMO_SDF_TICK("phase1-nearest");
+pamo_sdf_phase1_done:
+    PAMO_SDF_TICK("phase1-distance");
 
     /* ── Phase 2: Collision flags (3-axis ray tests for near-surface voxels) */
     float rayth = vs + 1e-6f;
@@ -350,6 +717,33 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
 #ifdef PAMO_USE_LIGHTRT
         /* Reuse lbvh from Phase 1. */
         if (lbvh) {
+#ifdef PAMO_USE_PTHREADS
+            int nt = pamo_sdf_thread_count(R);
+            pthread_t *thr = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
+            sdf_lightrt_rays_arg *args =
+                (sdf_lightrt_rays_arg *)malloc((size_t)nt * sizeof(sdf_lightrt_rays_arg));
+            int threaded = 0;
+            if (thr && args) {
+                int32_t per = (R + nt - 1) / nt;
+                int created = 0;
+                for (int t = 0; t < nt; t++) {
+                    args[t] = (sdf_lightrt_rays_arg){
+                        .bvh = lbvh, .collide = collide, .dist = dist, .R = R,
+                        .iz_start = t*per, .iz_end = (t+1)*per > R ? R : (t+1)*per,
+                        .grid_ox = gox, .grid_oy = goy, .grid_oz = goz,
+                        .voxel_size = vs, .rayth = rayth,
+                    };
+                    if (pthread_create(&thr[t], NULL, sdf_lightrt_rays_worker, &args[t]) == 0)
+                        created++;
+                    else
+                        break;
+                }
+                for (int t = 0; t < created; t++) pthread_join(thr[t], NULL);
+                threaded = (created == nt);
+            }
+            free(thr); free(args);
+            if (!threaded) {
+#endif
             for (int32_t iz = 0; iz < R; iz++)
                 for (int32_t iy = 0; iy < R; iy++)
                     for (int32_t ix = 0; ix < R; ix++) {
@@ -369,6 +763,9 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                         d[0]=0; d[1]=0; d[2]=1;
                         if (lightrt_bvh_any_hit(lbvh, o, d, rayth)) collide[idx*3+2] = 1;
                     }
+#ifdef PAMO_USE_PTHREADS
+            }
+#endif
             lightrt_bvh_destroy(lbvh);
         }
 #endif
@@ -384,6 +781,34 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
      * faster: each near-surface voxel touches only a handful of nearby
      * triangles. */
     {
+#ifdef PAMO_USE_PTHREADS
+        int nt = pamo_sdf_thread_count(R);
+        pthread_t *thr = (pthread_t *)malloc((size_t)nt * sizeof(pthread_t));
+        sdf_fallback_rays_arg *args =
+            (sdf_fallback_rays_arg *)malloc((size_t)nt * sizeof(sdf_fallback_rays_arg));
+        int threaded = 0;
+        if (thr && args) {
+            int32_t per = (R + nt - 1) / nt;
+            int created = 0;
+            for (int t = 0; t < nt; t++) {
+                args[t] = (sdf_fallback_rays_arg){
+                    .mesh = m, .bvh = bvh, .collide = collide, .dist = dist,
+                    .R = R, .iz_start = t*per,
+                    .iz_end = (t+1)*per > R ? R : (t+1)*per,
+                    .grid_ox = gox, .grid_oy = goy, .grid_oz = goz,
+                    .voxel_size = vs, .rayth = rayth,
+                };
+                if (pthread_create(&thr[t], NULL, sdf_fallback_rays_worker, &args[t]) == 0)
+                    created++;
+                else
+                    break;
+            }
+            for (int t = 0; t < created; t++) pthread_join(thr[t], NULL);
+            threaded = (created == nt);
+        }
+        free(thr); free(args);
+        if (!threaded) {
+#endif
         pamo_overlap_result ov;
         pamo_overlap_result_init(&ov, &m->alloc);
         for (int32_t iz = 0; iz < R; iz++)
@@ -437,6 +862,9 @@ pamo_error pamo_compute_sdf(double *grid_out, int32_t R,
                     }
                 }
         pamo_overlap_result_destroy(&ov);
+#ifdef PAMO_USE_PTHREADS
+        }
+#endif
     }
     }
     PAMO_SDF_TICK("phase2-rays");

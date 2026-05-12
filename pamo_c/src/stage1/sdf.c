@@ -3,6 +3,12 @@
 #define _POSIX_C_SOURCE 199309L
 #endif
 
+/* On macOS, _POSIX_C_SOURCE alone hides BSD extensions used below
+ * (sysconf(_SC_NPROCESSORS_ONLN)). _DARWIN_C_SOURCE re-exposes them. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
+
 /*
  * Copyright 2024 Light Transport Entertainment Inc.
  * SPDX-License-Identifier: Apache-2.0
